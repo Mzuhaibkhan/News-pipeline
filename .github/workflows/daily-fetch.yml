@@ -1,0 +1,36 @@
+name: Daily News Pipeline
+
+on:
+  schedule:
+    # Runs every day at 02:00 UTC (7:30 AM IST)
+    - cron: "0 2 * * *"
+  workflow_dispatch: # allows manual trigger from GitHub UI
+
+jobs:
+  fetch-news:
+    name: Fetch & Upsert News
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run fetch pipeline
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_DB_NAME: ${{ secrets.MONGO_DB_NAME }}
+          MONGO_COLLECTION: ${{ secrets.MONGO_COLLECTION }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          GUARDIAN_KEY: ${{ secrets.GUARDIAN_KEY }}
+        run: python scripts/fetch.py
