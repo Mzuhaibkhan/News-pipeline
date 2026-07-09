@@ -250,6 +250,7 @@ def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
+'''
 def fetch_guardian() -> Generator[dict[str, Any], None, None]:
     """Yield articles from The Guardian Open Platform API."""
     if not GUARDIAN_KEY:
@@ -300,6 +301,7 @@ def fetch_guardian() -> Generator[dict[str, Any], None, None]:
             }
 
         time.sleep(REQUEST_DELAY)
+'''
 
 
 def fetch_rss() -> Generator[dict[str, Any], None, None]:
@@ -394,6 +396,7 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
+'''
 def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
     if not TIINGO_KEY: return
     url = "https://api.tiingo.com/tiingo/news?limit=10"
@@ -421,6 +424,7 @@ def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
             }
     except Exception as e:
         log.error(f"Error fetching Tiingo: {e}")
+'''
 
 
 def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
@@ -701,9 +705,9 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
     # Chain all sources
     sources = [
         fetch_newsapi(),
-        fetch_guardian(),
+        #fetch_guardian(),
         fetch_rss(),
-        fetch_tiingo(),
+        #fetch_tiingo(),
         fetch_marketaux(),
         #fetch_stock_news_api(),
         fetch_apitube(),
