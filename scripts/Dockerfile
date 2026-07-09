@@ -6,8 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the script
-COPY fetch.py .
+# Copy all python scripts
+COPY *.py .
 
-# Run the pipeline once and exit (Job, not a long-running service)
-CMD ["python", "fetch.py"]
+# Run the web service
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]

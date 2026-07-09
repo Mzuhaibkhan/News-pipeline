@@ -609,7 +609,7 @@ def get_collection():
     """Return the MongoDB collection, raising on connection failure."""
     if not MONGO_URI:
         log.critical("MONGO_URI is not set in .env — cannot connect to MongoDB.")
-        sys.exit(1)
+        raise RuntimeError("MONGO_URI is not set in .env")
 
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
@@ -617,7 +617,7 @@ def get_collection():
         log.info("Connected to MongoDB cluster.")
     except ConnectionFailure as exc:
         log.critical("MongoDB connection failed: %s", exc)
-        sys.exit(1)
+        raise RuntimeError(f"MongoDB connection failed: {exc}")
 
     db = client[MONGO_DB_NAME]
     collection = db[MONGO_COLLECTION]
@@ -667,7 +667,7 @@ def upsert_articles(collection, articles: list[dict[str, Any]]) -> tuple[int, in
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
-def run_pipeline() -> None:
+def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
     """Main entry point: fetch → enrich → upsert."""
     log.info("=" * 60)
     log.info("News Pipeline starting at %s", datetime.now(timezone.utc).isoformat())
@@ -677,10 +677,11 @@ def run_pipeline() -> None:
 
     total_inserted = total_updated = total_errors = 0
     batch: list[dict[str, Any]] = []
+    all_fetched: list[dict[str, Any]] = []
     BATCH_SIZE = 50
 
     def flush_batch() -> None:
-        nonlocal total_inserted, total_updated, total_errors, batch
+        nonlocal total_inserted, total_updated, total_errors, batch, all_fetched
         if not batch:
             return
         ins, upd, err = upsert_articles(collection, batch)
@@ -691,6 +692,8 @@ def run_pipeline() -> None:
             "Flushed batch of %d — inserted: %d, updated: %d, errors: %d",
             len(batch), ins, upd, err,
         )
+        if return_data:
+            all_fetched.extend(batch)
         batch = []
 
     # Chain all sources
@@ -726,6 +729,8 @@ def run_pipeline() -> None:
         total_inserted, total_updated, total_errors,
     )
     log.info("=" * 60)
+    
+    return all_fetched
 
 
 if __name__ == "__main__":
