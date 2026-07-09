@@ -74,6 +74,17 @@ MONGO_COLLECTION: str = os.getenv("MONGO_COLLECTION", "articles")
 NEWSAPI_KEY: str = os.getenv("NEWSAPI_KEY", "")
 GUARDIAN_KEY: str = os.getenv("GUARDIAN_KEY", "")
 
+TIINGO_KEY: str = os.getenv("TIINGO_KEY", "")
+MARKETAUX_KEY: str = os.getenv("MARKETAUX_KEY", "")
+STOCK_NEWS_KEY: str = os.getenv("STOCK_NEWS_KEY", "")
+APITUBE_KEY: str = os.getenv("APITUBE_KEY", "")
+GNEWS_KEY: str = os.getenv("GNEWS_KEY", "")
+FINNHUB_KEY: str = os.getenv("FINNHUB_KEY", "")
+
+CUSTOM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
 # NewsAPI — top headlines config
 NEWSAPI_CATEGORIES: list[str] = [
     "business", "entertainment", "general",
@@ -383,6 +394,213 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
+def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
+    if not TIINGO_KEY: return
+    url = "https://api.tiingo.com/tiingo/news?limit=10"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Token {TIINGO_KEY}"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        for item in data:
+            url_str = (item.get("url") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"Tiingo - {item.get('source')}",
+                "source_type": "tiingo",
+                "category": "general",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("description") or "").strip(),
+                "published_at": _parse_dt(item.get("publishedDate")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching Tiingo: {e}")
+
+
+def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
+    if not MARKETAUX_KEY: return
+    url = f"https://api.marketaux.com/v1/news/all?api_token={MARKETAUX_KEY}&language=en&limit=10"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        for item in data:
+            url_str = (item.get("url") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"Marketaux - {item.get('source')}",
+                "source_type": "marketaux",
+                "category": "general",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("description") or "").strip(),
+                "published_at": _parse_dt(item.get("published_at")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching Marketaux: {e}")
+
+
+def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
+    if not STOCK_NEWS_KEY: return
+    url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        for item in data:
+            url_str = (item.get("news_url") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"StockNewsAPI - {item.get('source_name')}",
+                "source_type": "stocknewsapi",
+                "category": "general",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("text") or "").strip(),
+                "published_at": _parse_dt(item.get("date")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching Stock News API: {e}")
+
+
+def fetch_apitube() -> Generator[dict[str, Any], None, None]:
+    if not APITUBE_KEY: return
+    url = f"https://api.apitube.io/v1/news/everything?api_key={APITUBE_KEY}&limit=10"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json().get("results", [])
+        for item in data:
+            url_str = (item.get("url") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"APITube - {item.get('source', {}).get('name', 'Unknown')}",
+                "source_type": "apitube",
+                "category": "general",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("summary") or item.get("content") or "").strip(),
+                "published_at": _parse_dt(item.get("published_at")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching APITube: {e}")
+
+
+def fetch_gnews() -> Generator[dict[str, Any], None, None]:
+    if not GNEWS_KEY: return
+    url = f"https://gnews.io/api/v4/search?q=stocks&lang=en&max=10&apikey={GNEWS_KEY}"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json().get("articles", [])
+        for item in data:
+            url_str = (item.get("url") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"GNews - {item.get('source', {}).get('name', 'Unknown')}",
+                "source_type": "gnews",
+                "category": "general",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("description") or item.get("content") or "").strip(),
+                "published_at": _parse_dt(item.get("publishedAt")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching GNews: {e}")
+
+
+def fetch_finnhub() -> Generator[dict[str, Any], None, None]:
+    if not FINNHUB_KEY: return
+    url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
+    try:
+        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        for item in data[:10]:
+            url_str = (item.get("url") or "").strip()
+            if not url_str: continue
+            dt = datetime.fromtimestamp(item["datetime"], tz=timezone.utc)
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": f"Finnhub - {item.get('source', 'General')}",
+                "source_type": "finnhub",
+                "category": "general",
+                "title": (item.get("headline") or "").strip(),
+                "description": (item.get("summary") or "").strip(),
+                "published_at": dt,
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching Finnhub: {e}")
+
+
+def fetch_sec_edgar() -> Generator[dict[str, Any], None, None]:
+    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom"
+    try:
+        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        for entry in feed.entries[:10]:
+            url_str = (entry.get("link") or "").strip()
+            if not url_str: continue
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": "SEC EDGAR",
+                "source_type": "sec_edgar",
+                "category": "regulatory",
+                "title": (entry.get("title") or "").strip(),
+                "description": (entry.get("summary") or "Corporate Regulatory Filing Submission.").strip(),
+                "published_at": _parse_dt(entry.get("updated")) or datetime.now(timezone.utc),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching SEC EDGAR: {e}")
+
+
+def fetch_reddit_rss() -> Generator[dict[str, Any], None, None]:
+    url = "https://www.reddit.com/r/stocks/.rss"
+    try:
+        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        for entry in feed.entries[:10]:
+            url_str = (entry.get("link") or "").strip()
+            if not url_str: continue
+            desc = "Social sentiment post."
+            content_list = entry.get("content", [])
+            if content_list and len(content_list) > 0:
+                desc = content_list[0].get("value", desc)
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": "Reddit /r/stocks",
+                "source_type": "reddit_rss",
+                "category": "social",
+                "title": (entry.get("title") or "").strip(),
+                "description": desc.strip(),
+                "published_at": _parse_dt(entry.get("updated")) or datetime.now(timezone.utc),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching Reddit RSS: {e}")
+
+
 # ---------------------------------------------------------------------------
 # MongoDB
 # ---------------------------------------------------------------------------
@@ -476,7 +694,19 @@ def run_pipeline() -> None:
         batch = []
 
     # Chain all sources
-    sources = [fetch_newsapi(), fetch_guardian(), fetch_rss()]
+    sources = [
+        fetch_newsapi(),
+        fetch_guardian(),
+        fetch_rss(),
+        fetch_tiingo(),
+        fetch_marketaux(),
+        fetch_stock_news_api(),
+        fetch_apitube(),
+        fetch_gnews(),
+        fetch_finnhub(),
+        fetch_sec_edgar(),
+        fetch_reddit_rss(),
+    ]
 
     for source_gen in sources:
         for raw_article in source_gen:
@@ -500,3 +730,10 @@ def run_pipeline() -> None:
 
 if __name__ == "__main__":
     run_pipeline()
+    
+    # Run cleanup automatically after fetching
+    try:
+        import clear_old_news
+        clear_old_news.run_cleanup(days_old=15)
+    except Exception as e:
+        log.error(f"Failed to run automatic cleanup: {e}")
