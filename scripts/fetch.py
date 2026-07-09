@@ -552,7 +552,9 @@ def fetch_finnhub() -> Generator[dict[str, Any], None, None]:
 def fetch_sec_edgar() -> Generator[dict[str, Any], None, None]:
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom"
     try:
-        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        # SEC EDGAR strictly requires a specifically formatted User-Agent to avoid 403 Forbidden
+        sec_headers = {"User-Agent": "NewsPipelineBot admin@example.com"}
+        response = requests.get(url, headers=sec_headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         feed = feedparser.parse(response.content)
         for entry in feed.entries[:10]:
@@ -740,6 +742,40 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
                 or query_lower in str(a.get("content", "")).lower()
             ]
         return all_fetched
+
+
+def get_saved_articles(query: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """Retrieve already fetched articles from MongoDB."""
+    collection = get_collection()
+    
+    # Exclude _id to make it easily JSON serializable
+    projection = {"_id": 0}
+    
+    if query:
+        # Use MongoDB text search if possible, else fallback to regex
+        # We already have a text index on title, description, keywords
+        db_filter = {"$text": {"$search": query}}
+        cursor = collection.find(db_filter, projection).sort([("published_at", -1)]).limit(limit)
+    else:
+        cursor = collection.find({}, projection).sort([("published_at", -1)]).limit(limit)
+        
+    articles = list(cursor)
+    
+    # If text search returned nothing, fallback to regex search for safety
+    if query and not articles:
+        regex_filter = {
+            "$or": [
+                {"title": {"$regex": query, "$options": "i"}},
+                {"description": {"$regex": query, "$options": "i"}},
+                {"content": {"$regex": query, "$options": "i"}},
+                {"category": {"$regex": query, "$options": "i"}},
+                {"keywords": {"$regex": query, "$options": "i"}}
+            ]
+        }
+        cursor = collection.find(regex_filter, projection).sort([("published_at", -1)]).limit(limit)
+        articles = list(cursor)
+        
+    return articles
 
 
 if __name__ == "__main__":

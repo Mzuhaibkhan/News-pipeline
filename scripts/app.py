@@ -39,6 +39,26 @@ def trigger_fetch(company: str = Query(None, description="Optional company name 
             "message": str(e)
         }
 
+@app.get("/api/articles")
+def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(100, description="Max number of articles to return")) -> Dict[str, Any]:
+    """
+    Retrieves already fetched articles directly from the database without querying external APIs.
+    This naturally skips any broken/revoked external APIs.
+    """
+    try:
+        articles = fetch.get_saved_articles(query=company, limit=limit)
+        return {
+            "status": "success",
+            "count": len(articles),
+            "data": articles
+        }
+    except Exception as e:
+        log.error(f"Error fetching saved articles: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
 @app.post("/api/cleanup")
 def trigger_cleanup(days_old: int = Query(15, description="Number of days old before deleting")) -> Dict[str, str]:
     """
