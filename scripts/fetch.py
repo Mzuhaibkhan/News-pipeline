@@ -98,7 +98,7 @@ GUARDIAN_SECTIONS: list[str] = [
     "world", "technology", "science", "business",
     "sport", "culture", "politics", "environment",
 ]
-GUARDIAN_PAGE_SIZE: int = 50  # max per request
+GUARDIAN_PAGE_SIZE: int = 30  # max per request
 
 # RSS feeds — add/remove freely
 RSS_FEEDS: dict[str, str] = {
@@ -447,7 +447,7 @@ def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
     except Exception as e:
         log.error(f"Error fetching Marketaux: {e}")
 
-
+"""
 def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
     if not STOCK_NEWS_KEY: return
     url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
@@ -471,7 +471,7 @@ def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
             }
     except Exception as e:
         log.error(f"Error fetching Stock News API: {e}")
-
+"""
 
 def fetch_apitube() -> Generator[dict[str, Any], None, None]:
     if not APITUBE_KEY: return
@@ -609,7 +609,7 @@ def get_collection():
     """Return the MongoDB collection, raising on connection failure."""
     if not MONGO_URI:
         log.critical("MONGO_URI is not set in .env — cannot connect to MongoDB.")
-        raise RuntimeError("MONGO_URI is not set in .env")
+        sys.exit(1)
 
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
@@ -617,7 +617,7 @@ def get_collection():
         log.info("Connected to MongoDB cluster.")
     except ConnectionFailure as exc:
         log.critical("MongoDB connection failed: %s", exc)
-        raise RuntimeError(f"MongoDB connection failed: {exc}")
+        sys.exit(1)
 
     db = client[MONGO_DB_NAME]
     collection = db[MONGO_COLLECTION]
@@ -667,7 +667,7 @@ def upsert_articles(collection, articles: list[dict[str, Any]]) -> tuple[int, in
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
-def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
+def run_pipeline(return_data: bool = False, query: str | None = None) -> list[dict[str, Any]] | None:
     """Main entry point: fetch → enrich → upsert."""
     log.info("=" * 60)
     log.info("News Pipeline starting at %s", datetime.now(timezone.utc).isoformat())
@@ -684,6 +684,8 @@ def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
         nonlocal total_inserted, total_updated, total_errors, batch, all_fetched
         if not batch:
             return
+        if return_data:
+            all_fetched.extend(batch)
         ins, upd, err = upsert_articles(collection, batch)
         total_inserted += ins
         total_updated += upd
@@ -692,8 +694,6 @@ def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
             "Flushed batch of %d — inserted: %d, updated: %d, errors: %d",
             len(batch), ins, upd, err,
         )
-        if return_data:
-            all_fetched.extend(batch)
         batch = []
 
     # Chain all sources
@@ -703,7 +703,7 @@ def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
         fetch_rss(),
         fetch_tiingo(),
         fetch_marketaux(),
-        fetch_stock_news_api(),
+        #fetch_stock_news_api(),
         fetch_apitube(),
         fetch_gnews(),
         fetch_finnhub(),
@@ -729,14 +729,22 @@ def run_pipeline(return_data: bool = False) -> list[dict[str, Any]]:
         total_inserted, total_updated, total_errors,
     )
     log.info("=" * 60)
-    
-    return all_fetched
+
+    if return_data:
+        if query:
+            query_lower = query.lower()
+            return [
+                a for a in all_fetched
+                if query_lower in str(a.get("title", "")).lower()
+                or query_lower in str(a.get("description", "")).lower()
+                or query_lower in str(a.get("content", "")).lower()
+            ]
+        return all_fetched
 
 
 if __name__ == "__main__":
     run_pipeline()
-    
-    # Run cleanup automatically after fetching
+
     try:
         import clear_old_news
         clear_old_news.run_cleanup(days_old=15)

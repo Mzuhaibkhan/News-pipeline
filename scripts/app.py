@@ -20,13 +20,13 @@ def read_root() -> Dict[str, str]:
 
 @app.post("/api/fetch")
 @app.get("/api/fetch")
-def trigger_fetch() -> Dict[str, Any]:
+def trigger_fetch(company: str = Query(None, description="Optional company name or ticker to search for")) -> Dict[str, Any]:
     """
     Triggers the fetch pipeline, upserts to MongoDB, and returns the fetched articles.
-    This runs synchronously.
+    If 'company' is provided, it specifically fetches articles related to that company.
     """
     try:
-        articles = fetch.run_pipeline(return_data=True)
+        articles = fetch.run_pipeline(return_data=True, query=company)
         return {
             "status": "success",
             "fetched_count": len(articles),
