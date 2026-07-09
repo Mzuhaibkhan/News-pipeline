@@ -19,6 +19,7 @@ def read_root() -> Dict[str, str]:
     return {"status": "ok", "message": "News Pipeline Service is running"}
 
 @app.post("/api/fetch")
+@app.get("/api/fetch")
 def trigger_fetch() -> Dict[str, Any]:
     """
     Triggers the fetch pipeline, upserts to MongoDB, and returns the fetched articles.
