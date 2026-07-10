@@ -40,7 +40,7 @@ def trigger_fetch(company: str = Query(None, description="Optional company name 
         }
 
 @app.get("/api/articles")
-def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(100, description="Max number of articles to return")) -> Dict[str, Any]:
+def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(None, description="Max number of articles to return")) -> Dict[str, Any]:
     """
     Retrieves already fetched articles directly from the database without querying external APIs.
     This naturally skips any broken/revoked external APIs.

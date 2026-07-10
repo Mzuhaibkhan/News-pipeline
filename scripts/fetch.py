@@ -250,7 +250,7 @@ def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
-'''
+
 def fetch_guardian() -> Generator[dict[str, Any], None, None]:
     """Yield articles from The Guardian Open Platform API."""
     if not GUARDIAN_KEY:
@@ -301,7 +301,6 @@ def fetch_guardian() -> Generator[dict[str, Any], None, None]:
             }
 
         time.sleep(REQUEST_DELAY)
-'''
 
 
 def fetch_rss() -> Generator[dict[str, Any], None, None]:
@@ -396,7 +395,7 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
-'''
+
 def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
     if not TIINGO_KEY: return
     url = "https://api.tiingo.com/tiingo/news?limit=10"
@@ -424,7 +423,7 @@ def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
             }
     except Exception as e:
         log.error(f"Error fetching Tiingo: {e}")
-'''
+
 
 
 def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
@@ -451,7 +450,7 @@ def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
     except Exception as e:
         log.error(f"Error fetching Marketaux: {e}")
 
-"""
+
 def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
     if not STOCK_NEWS_KEY: return
     url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
@@ -475,7 +474,7 @@ def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
             }
     except Exception as e:
         log.error(f"Error fetching Stock News API: {e}")
-"""
+
 
 def fetch_apitube() -> Generator[dict[str, Any], None, None]:
     if not APITUBE_KEY: return
@@ -748,7 +747,7 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
         return all_fetched
 
 
-def get_saved_articles(query: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def get_saved_articles(query: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     """Retrieve already fetched articles from MongoDB."""
     collection = get_collection()
     
@@ -759,9 +758,12 @@ def get_saved_articles(query: str | None = None, limit: int = 100) -> list[dict[
         # Use MongoDB text search if possible, else fallback to regex
         # We already have a text index on title, description, keywords
         db_filter = {"$text": {"$search": query}}
-        cursor = collection.find(db_filter, projection).sort([("published_at", -1)]).limit(limit)
+        cursor = collection.find(db_filter, projection).sort([("published_at", -1)])
     else:
-        cursor = collection.find({}, projection).sort([("published_at", -1)]).limit(limit)
+        cursor = collection.find({}, projection).sort([("published_at", -1)])
+        
+    if limit is not None and limit > 0:
+        cursor = cursor.limit(limit)
         
     articles = list(cursor)
     
@@ -776,7 +778,9 @@ def get_saved_articles(query: str | None = None, limit: int = 100) -> list[dict[
                 {"keywords": {"$regex": query, "$options": "i"}}
             ]
         }
-        cursor = collection.find(regex_filter, projection).sort([("published_at", -1)]).limit(limit)
+        cursor = collection.find(regex_filter, projection).sort([("published_at", -1)])
+        if limit is not None and limit > 0:
+            cursor = cursor.limit(limit)
         articles = list(cursor)
         
     return articles
