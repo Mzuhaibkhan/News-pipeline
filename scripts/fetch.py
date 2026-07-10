@@ -90,7 +90,7 @@ NEWSAPI_CATEGORIES: list[str] = [
     "business", "entertainment", "general",
     "health", "science", "sports", "technology",
 ]
-NEWSAPI_COUNTRY: str = "us"
+NEWSAPI_COUNTRIES: list[str] = ["us", "in"]
 NEWSAPI_PAGE_SIZE: int = 100  # max allowed
 
 # The Guardian — sections to query
@@ -200,7 +200,7 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 
 def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
-    """Yield articles from NewsAPI top-headlines (all configured categories)."""
+    """Yield articles from NewsAPI top-headlines (all configured categories/countries)."""
     if not NEWSAPI_KEY:
         log.warning("NEWSAPI_KEY not set — skipping NewsAPI source.")
         return
@@ -208,46 +208,47 @@ def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
     base_url = "https://newsapi.org/v2/top-headlines"
     headers = {"X-Api-Key": NEWSAPI_KEY}
 
-    for category in NEWSAPI_CATEGORIES:
-        params = {
-            "country": NEWSAPI_COUNTRY,
-            "category": category,
-            "pageSize": NEWSAPI_PAGE_SIZE,
-        }
-        try:
-            resp = requests.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
-            log.error("NewsAPI request failed for category=%s: %s", category, exc)
-            time.sleep(REQUEST_DELAY)
-            continue
-
-        articles = data.get("articles", [])
-        log.info("NewsAPI [%s] → %d articles", category, len(articles))
-
-        for raw in articles:
-            url = (raw.get("url") or "").strip()
-            if not url or url == "https://removed.com":
+    for country in NEWSAPI_COUNTRIES:
+        for category in NEWSAPI_CATEGORIES:
+            params = {
+                "country": country,
+                "category": category,
+                "pageSize": NEWSAPI_PAGE_SIZE,
+            }
+            try:
+                resp = requests.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.RequestException as exc:
+                log.error("NewsAPI request failed for country=%s category=%s: %s", country, category, exc)
+                time.sleep(REQUEST_DELAY)
                 continue
 
-            source_name = (raw.get("source") or {}).get("name", "NewsAPI")
-            yield {
-                "url": url,
-                "url_hash": _url_hash(url),
-                "source": source_name,
-                "source_type": "newsapi",
-                "category": category,
-                "title": (raw.get("title") or "").strip(),
-                "description": (raw.get("description") or "").strip(),
-                "content": (raw.get("content") or "").strip(),
-                "author": (raw.get("author") or "").strip(),
-                "image_url": raw.get("urlToImage"),
-                "published_at": _parse_dt(raw.get("publishedAt")),
-                "fetched_at": datetime.now(timezone.utc),
-            }
+            articles = data.get("articles", [])
+            log.info("NewsAPI [%s-%s] → %d articles", country, category, len(articles))
 
-        time.sleep(REQUEST_DELAY)
+            for raw in articles:
+                url = (raw.get("url") or "").strip()
+                if not url or url == "https://removed.com":
+                    continue
+
+                source_name = (raw.get("source") or {}).get("name", "NewsAPI")
+                yield {
+                    "url": url,
+                    "url_hash": _url_hash(url),
+                    "source": source_name,
+                    "source_type": "newsapi",
+                    "category": category,
+                    "title": (raw.get("title") or "").strip(),
+                    "description": (raw.get("description") or "").strip(),
+                    "content": (raw.get("content") or "").strip(),
+                    "author": (raw.get("author") or "").strip(),
+                    "image_url": raw.get("urlToImage"),
+                    "published_at": _parse_dt(raw.get("publishedAt")),
+                    "fetched_at": datetime.now(timezone.utc),
+                }
+
+            time.sleep(REQUEST_DELAY)
 
 
 
