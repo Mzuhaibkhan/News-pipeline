@@ -80,6 +80,8 @@ STOCK_NEWS_KEY: str = os.getenv("STOCK_NEWS_KEY", "")
 APITUBE_KEY: str = os.getenv("APITUBE_KEY", "")
 GNEWS_KEY: str = os.getenv("GNEWS_KEY", "")
 FINNHUB_KEY: str = os.getenv("FINNHUB_KEY", "")
+INDIANAPI_KEY: str = os.getenv("INDIANAPI_KEY", "")
+NEWSDATA_KEY: str = os.getenv("NEWSDATA_KEY", "")
 
 CUSTOM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -607,6 +609,82 @@ def fetch_reddit_rss() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching Reddit RSS: {e}")
 
 
+def fetch_indianapi() -> Generator[dict[str, Any], None, None]:
+    """Yield articles from IndianAPI (dedicated Indian market news)."""
+    if not INDIANAPI_KEY:
+        return
+    url = "https://analyst.indianapi.in/get/market_news"
+    headers = {"X-API-Key": INDIANAPI_KEY}
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        
+        # IndianAPI typically returns a list of news items
+        for item in data:
+            url_str = (item.get("link") or "").strip()
+            if not url_str:
+                continue
+            
+            pub_raw = item.get("pubDate") or item.get("date") or item.get("published_at")
+            published_at = _parse_dt(pub_raw) if pub_raw else datetime.now(timezone.utc)
+            
+            yield {
+                "url": url_str,
+                "url_hash": _url_hash(url_str),
+                "source": "IndianAPI",
+                "source_type": "indianapi",
+                "category": "business",
+                "title": (item.get("title") or "").strip(),
+                "description": (item.get("description") or "").strip(),
+                "published_at": published_at,
+                "fetched_at": datetime.now(timezone.utc),
+            }
+    except Exception as e:
+        log.error(f"Error fetching IndianAPI: {e}")
+
+
+def fetch_newsdata() -> Generator[dict[str, Any], None, None]:
+    """Yield business articles filtered for India from NewsData.io."""
+    if not NEWSDATA_KEY:
+        return
+    url = f"https://newsdata.io/api/1/news?apikey={NEWSDATA_KEY}&country=in&category=business"
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("status") == "success":
+            results = data.get("results", [])
+            for article in results:
+                url_str = (article.get("link") or "").strip()
+                if not url_str:
+                    continue
+                
+                source_id = article.get("source_id") or "NewsData"
+                pub_raw = article.get("pubDate") or article.get("published_at")
+                published_at = _parse_dt(pub_raw) if pub_raw else datetime.now(timezone.utc)
+                
+                yield {
+                    "url": url_str,
+                    "url_hash": _url_hash(url_str),
+                    "source": f"NewsData - {source_id.upper()}",
+                    "source_type": "newsdata",
+                    "category": "business",
+                    "title": (article.get("title") or "").strip(),
+                    "description": (article.get("description") or "").strip(),
+                    "content": (article.get("content") or "").strip(),
+                    "author": (article.get("creator") or [""])[0] if isinstance(article.get("creator"), list) and article.get("creator") else "",
+                    "image_url": article.get("image_url"),
+                    "published_at": published_at,
+                    "fetched_at": datetime.now(timezone.utc),
+                }
+        else:
+            log.warning("NewsData API status was not 'success': %s", data.get("status"))
+    except Exception as e:
+        log.error(f"Error fetching NewsData.io: {e}")
+
+
 # ---------------------------------------------------------------------------
 # MongoDB
 # ---------------------------------------------------------------------------
@@ -715,6 +793,8 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
         fetch_finnhub(),
         fetch_sec_edgar(),
         fetch_reddit_rss(),
+        fetch_indianapi(),
+        fetch_newsdata(),
     ]
 
     for source_gen in sources:
