@@ -34,6 +34,7 @@ from typing import Any, Generator
 
 import feedparser
 import nltk
+import certifi
 import requests
 from dotenv import load_dotenv
 from langdetect import LangDetectException, detect
@@ -696,7 +697,7 @@ def get_collection():
         sys.exit(1)
 
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
         client.admin.command("ping")  # fail-fast connectivity check
         log.info("Connected to MongoDB cluster.")
     except ConnectionFailure as exc:

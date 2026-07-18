@@ -9,6 +9,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
+import certifi
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
@@ -35,7 +36,7 @@ def get_collection():
         raise RuntimeError("MONGO_URI is not set in .env")
 
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
         client.admin.command("ping")
     except ConnectionFailure as exc:
         log.critical("MongoDB connection failed: %s", exc)
