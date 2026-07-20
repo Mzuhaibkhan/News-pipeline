@@ -694,7 +694,7 @@ def get_collection():
     """Return the MongoDB collection, raising on connection failure."""
     if not MONGO_URI:
         log.critical("MONGO_URI is not set in .env — cannot connect to MongoDB.")
-        sys.exit(1)
+        raise RuntimeError("MONGO_URI is not set in .env")
 
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
@@ -702,7 +702,7 @@ def get_collection():
         log.info("Connected to MongoDB cluster.")
     except ConnectionFailure as exc:
         log.critical("MongoDB connection failed: %s", exc)
-        sys.exit(1)
+        raise RuntimeError(f"MongoDB connection failed: {exc}")
 
     db = client[MONGO_DB_NAME]
     collection = db[MONGO_COLLECTION]
