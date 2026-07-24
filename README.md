@@ -120,7 +120,7 @@ Retrieves already-fetched articles directly from the database without querying e
 }
 ```
 
-### 3. Cleanup Old News
+### 4. Cleanup Old News
 
 **Endpoint:** `POST /api/cleanup`
 
@@ -136,3 +136,89 @@ Triggers a cleanup operation to delete old articles from the MongoDB database.
   "message": "Cleared articles older than 15 days"
 }
 ```
+
+---
+
+## 📬 Newsletter & Email Feature
+
+This feature formats today's fetched news into a responsive HTML newsletter and emails it to users or subscribers.
+
+### SMTP Setup
+
+Configure your SMTP credentials in `.env`:
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASSWORD=your_app_password_here
+EMAIL_FROM=News Pipeline Digest <your_email@gmail.com>
+```
+> **Note for Gmail users:** Generate an **App Password** from your Google Account security settings (`Security -> 2-Step Verification -> App Passwords`).
+
+### Newsletter Endpoints
+
+#### 1. Send Digest to Email (On-Demand)
+**Endpoint:** `POST /api/newsletter/send`
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "limit": 10,
+  "company": "Apple"
+}
+```
+
+#### 2. Subscribe to Daily Newsletter
+**Endpoint:** `POST /api/newsletter/subscribe`
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+#### 3. Unsubscribe
+**Endpoint:** `POST /api/newsletter/unsubscribe`
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+#### 4. List Active Subscribers
+**Endpoint:** `GET /api/newsletter/subscribers`
+
+#### 5. Broadcast to All Active Subscribers
+**Endpoint:** `POST /api/newsletter/broadcast`
+
+**Request Body (Optional):**
+```json
+{
+  "limit": 10
+}
+```
+
+### Command Line Interface (CLI)
+
+You can also manage subscribers and send newsletters directly from the command line using `scripts/newsletter.py`:
+
+```bash
+cd scripts
+
+# Send today's news digest directly to an email
+python newsletter.py --send-to user@example.com --limit 10
+
+# Subscribe an email
+python newsletter.py --subscribe user@example.com
+
+# Unsubscribe an email
+python newsletter.py --unsubscribe user@example.com
+
+# Broadcast today's news to all active subscribers
+python newsletter.py --broadcast
+```
+
