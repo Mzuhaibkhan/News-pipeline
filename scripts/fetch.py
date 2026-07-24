@@ -36,6 +36,8 @@ import feedparser
 import nltk
 import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from dotenv import load_dotenv
 from langdetect import LangDetectException, detect
 from pymongo import MongoClient, UpdateOne
@@ -44,8 +46,33 @@ from rake_nltk import Rake
 from textblob import TextBlob
 
 # ---------------------------------------------------------------------------
+# Retry Session Factory
+# ---------------------------------------------------------------------------
+
+def get_retry_session(
+    retries: int = 3,
+    backoff_factor: float = 1.0,
+    status_forcelist: tuple[int, ...] = (429, 500, 502, 503, 504),
+) -> requests.Session:
+    """Create a requests Session with HTTP retry adapter and exponential backoff."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+http_session = get_retry_session()
+
+# ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
+
 
 load_dotenv()
 
@@ -202,15 +229,56 @@ def _parse_dt(value: str | None) -> datetime | None:
     return None
 
 
-def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
-    """Yield articles from NewsAPI top-headlines (all configured categories/countries)."""
+def fetch_newsapi(query: str | None = None) -> Generator[dict[str, Any], None, None]:
+    """Yield articles from NewsAPI top-headlines or query search."""
     if not NEWSAPI_KEY:
         log.warning("NEWSAPI_KEY not set — skipping NewsAPI source.")
         return
 
-    base_url = "https://newsapi.org/v2/top-headlines"
     headers = {"X-Api-Key": NEWSAPI_KEY}
 
+    if query:
+        base_url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": query,
+            "pageSize": NEWSAPI_PAGE_SIZE,
+            "sortBy": "publishedAt",
+            "language": "en",
+        }
+        try:
+            resp = http_session.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            log.error("NewsAPI query search failed for query=%s: %s", query, exc)
+            return
+
+        articles = data.get("articles", [])
+        log.info("NewsAPI query search [%s] → %d articles", query, len(articles))
+
+        for raw in articles:
+            url = (raw.get("url") or "").strip()
+            if not url or url == "https://removed.com":
+                continue
+
+            source_name = (raw.get("source") or {}).get("name", "NewsAPI")
+            yield {
+                "url": url,
+                "url_hash": _url_hash(url),
+                "source": source_name,
+                "source_type": "newsapi",
+                "category": "general",
+                "title": (raw.get("title") or "").strip(),
+                "description": (raw.get("description") or "").strip(),
+                "content": (raw.get("content") or "").strip(),
+                "author": (raw.get("author") or "").strip(),
+                "image_url": raw.get("urlToImage"),
+                "published_at": _parse_dt(raw.get("publishedAt")),
+                "fetched_at": datetime.now(timezone.utc),
+            }
+        return
+
+    base_url = "https://newsapi.org/v2/top-headlines"
     for country in NEWSAPI_COUNTRIES:
         for category in NEWSAPI_CATEGORIES:
             params = {
@@ -219,7 +287,7 @@ def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
                 "pageSize": NEWSAPI_PAGE_SIZE,
             }
             try:
-                resp = requests.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+                resp = http_session.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as exc:
@@ -254,25 +322,29 @@ def fetch_newsapi() -> Generator[dict[str, Any], None, None]:
             time.sleep(REQUEST_DELAY)
 
 
-
-def fetch_guardian() -> Generator[dict[str, Any], None, None]:
+def fetch_guardian(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     """Yield articles from The Guardian Open Platform API."""
     if not GUARDIAN_KEY:
         log.warning("GUARDIAN_KEY not set — skipping Guardian source.")
         return
 
     base_url = "https://content.guardianapis.com/search"
+    sections = [None] if query else GUARDIAN_SECTIONS
 
-    for section in GUARDIAN_SECTIONS:
+    for section in sections:
         params = {
-            "section": section,
             "api-key": GUARDIAN_KEY,
             "page-size": GUARDIAN_PAGE_SIZE,
             "show-fields": "trailText,bodyText,byline,thumbnail",
             "order-by": "newest",
         }
+        if section:
+            params["section"] = section
+        if query:
+            params["q"] = query
+
         try:
-            resp = requests.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
+            resp = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as exc:
@@ -281,7 +353,7 @@ def fetch_guardian() -> Generator[dict[str, Any], None, None]:
             continue
 
         results = data.get("response", {}).get("results", [])
-        log.info("Guardian [%s] → %d articles", section, len(results))
+        log.info("Guardian [%s] → %d articles", query or section, len(results))
 
         for raw in results:
             url = (raw.get("webUrl") or "").strip()
@@ -294,7 +366,7 @@ def fetch_guardian() -> Generator[dict[str, Any], None, None]:
                 "url_hash": _url_hash(url),
                 "source": "The Guardian",
                 "source_type": "guardian",
-                "category": section,
+                "category": raw.get("sectionName", section or "general"),
                 "title": (raw.get("webTitle") or "").strip(),
                 "description": (fields.get("trailText") or "").strip(),
                 "content": (fields.get("bodyText") or "")[:3000].strip(),
@@ -307,8 +379,9 @@ def fetch_guardian() -> Generator[dict[str, Any], None, None]:
         time.sleep(REQUEST_DELAY)
 
 
-def fetch_rss() -> Generator[dict[str, Any], None, None]:
+def fetch_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     """Yield articles from all configured RSS feeds."""
+    query_lower = query.lower() if query else None
     for feed_name, feed_url in RSS_FEEDS.items():
         try:
             parsed = feedparser.parse(feed_url)
@@ -328,6 +401,21 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
             if not url:
                 continue
 
+            title = (entry.get("title") or "").strip()
+
+            # Description / summary
+            summary = ""
+            if entry.get("summary"):
+                summary = entry["summary"]
+            elif entry.get("description"):
+                summary = entry["description"]
+
+            # Query filter if present
+            if query_lower:
+                combined = f"{title} {summary}".lower()
+                if query_lower not in combined:
+                    continue
+
             # Published date — try multiple keys
             pub_raw = (
                 entry.get("published")
@@ -336,7 +424,6 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
             )
             published_at = _parse_dt(pub_raw)
 
-            # Try to get a struct_time fallback
             if published_at is None:
                 for key in ("published_parsed", "updated_parsed"):
                     ts = entry.get(key)
@@ -346,13 +433,6 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
                         except Exception:
                             pass
                         break
-
-            # Description / summary
-            summary = ""
-            if entry.get("summary"):
-                summary = entry["summary"]
-            elif entry.get("description"):
-                summary = entry["description"]
 
             # Content
             content = ""
@@ -387,7 +467,7 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
                 "source": feed_name,
                 "source_type": "rss",
                 "category": category,
-                "title": (entry.get("title") or "").strip(),
+                "title": title,
                 "description": summary.strip(),
                 "content": content.strip(),
                 "author": author,
@@ -400,15 +480,18 @@ def fetch_rss() -> Generator[dict[str, Any], None, None]:
 
 
 
-def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
+
+def fetch_tiingo(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not TIINGO_KEY: return
     url = "https://api.tiingo.com/tiingo/news?limit=10"
+    if query:
+        url += f"&tickers={query}"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Token {TIINGO_KEY}"
     }
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         for item in data:
@@ -430,11 +513,13 @@ def fetch_tiingo() -> Generator[dict[str, Any], None, None]:
 
 
 
-def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
+def fetch_marketaux(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not MARKETAUX_KEY: return
     url = f"https://api.marketaux.com/v1/news/all?api_token={MARKETAUX_KEY}&language=en&limit=10"
+    if query:
+        url += f"&search={query}"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("data", [])
         for item in data:
@@ -455,11 +540,14 @@ def fetch_marketaux() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching Marketaux: {e}")
 
 
-def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
+def fetch_stock_news_api(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not STOCK_NEWS_KEY: return
-    url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
+    if query:
+        url = f"https://stocknewsapi.com/api/v1?tickers={query}&items=10&token={STOCK_NEWS_KEY}"
+    else:
+        url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("data", [])
         for item in data:
@@ -480,11 +568,13 @@ def fetch_stock_news_api() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching Stock News API: {e}")
 
 
-def fetch_apitube() -> Generator[dict[str, Any], None, None]:
+def fetch_apitube(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not APITUBE_KEY: return
     url = f"https://api.apitube.io/v1/news/everything?api_key={APITUBE_KEY}&limit=10"
+    if query:
+        url += f"&q={query}"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("results", [])
         for item in data:
@@ -505,11 +595,12 @@ def fetch_apitube() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching APITube: {e}")
 
 
-def fetch_gnews() -> Generator[dict[str, Any], None, None]:
+def fetch_gnews(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not GNEWS_KEY: return
-    url = f"https://gnews.io/api/v4/search?q=stocks&lang=en&max=10&apikey={GNEWS_KEY}"
+    search_q = query if query else "stocks"
+    url = f"https://gnews.io/api/v4/search?q={search_q}&lang=en&max=10&apikey={GNEWS_KEY}"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("articles", [])
         for item in data:
@@ -530,11 +621,11 @@ def fetch_gnews() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching GNews: {e}")
 
 
-def fetch_finnhub() -> Generator[dict[str, Any], None, None]:
+def fetch_finnhub(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not FINNHUB_KEY: return
     url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
     try:
-        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         for item in data[:10]:
@@ -556,12 +647,12 @@ def fetch_finnhub() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching Finnhub: {e}")
 
 
-def fetch_sec_edgar() -> Generator[dict[str, Any], None, None]:
+def fetch_sec_edgar(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom"
     try:
         # SEC EDGAR strictly requires a specifically formatted User-Agent to avoid 403 Forbidden
         sec_headers = {"User-Agent": "NewsPipelineBot admin@example.com"}
-        response = requests.get(url, headers=sec_headers, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, headers=sec_headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         feed = feedparser.parse(response.content)
         for entry in feed.entries[:10]:
@@ -582,10 +673,13 @@ def fetch_sec_edgar() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching SEC EDGAR: {e}")
 
 
-def fetch_reddit_rss() -> Generator[dict[str, Any], None, None]:
-    url = "https://www.reddit.com/r/stocks/.rss"
+def fetch_reddit_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]:
+    if query:
+        url = f"https://www.reddit.com/search.rss?q={query}&sort=new"
+    else:
+        url = "https://www.reddit.com/r/stocks/.rss"
     try:
-        response = requests.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         feed = feedparser.parse(response.content)
         for entry in feed.entries[:10]:
@@ -598,7 +692,7 @@ def fetch_reddit_rss() -> Generator[dict[str, Any], None, None]:
             yield {
                 "url": url_str,
                 "url_hash": _url_hash(url_str),
-                "source": "Reddit /r/stocks",
+                "source": f"Reddit {'search:' + query if query else '/r/stocks'}",
                 "source_type": "reddit_rss",
                 "category": "social",
                 "title": (entry.get("title") or "").strip(),
@@ -610,14 +704,14 @@ def fetch_reddit_rss() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching Reddit RSS: {e}")
 
 
-def fetch_indianapi() -> Generator[dict[str, Any], None, None]:
+def fetch_indianapi(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     """Yield articles from IndianAPI (dedicated Indian market news)."""
     if not INDIANAPI_KEY:
         return
     url = "https://analyst.indianapi.in/get/market_news"
     headers = {"X-API-Key": INDIANAPI_KEY}
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         
@@ -645,13 +739,15 @@ def fetch_indianapi() -> Generator[dict[str, Any], None, None]:
         log.error(f"Error fetching IndianAPI: {e}")
 
 
-def fetch_newsdata() -> Generator[dict[str, Any], None, None]:
+def fetch_newsdata(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     """Yield business articles filtered for India from NewsData.io."""
     if not NEWSDATA_KEY:
         return
     url = f"https://newsdata.io/api/1/news?apikey={NEWSDATA_KEY}&country=in&category=business"
+    if query:
+        url += f"&q={query}"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         
@@ -755,7 +851,7 @@ def upsert_articles(collection, articles: list[dict[str, Any]]) -> tuple[int, in
 def run_pipeline(return_data: bool = False, query: str | None = None) -> list[dict[str, Any]] | None:
     """Main entry point: fetch → enrich → upsert."""
     log.info("=" * 60)
-    log.info("News Pipeline starting at %s", datetime.now(timezone.utc).isoformat())
+    log.info("News Pipeline starting at %s (query=%s)", datetime.now(timezone.utc).isoformat(), query)
     log.info("=" * 60)
 
     collection = get_collection()
@@ -781,22 +877,23 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
         )
         batch = []
 
-    # Chain all sources
+    # Chain all sources with query parameter propagation
     sources = [
-        fetch_newsapi(),
-        #fetch_guardian(),
-        fetch_rss(),
-        #fetch_tiingo(),
-        fetch_marketaux(),
-        #fetch_stock_news_api(),
-        fetch_apitube(),
-        fetch_gnews(),
-        fetch_finnhub(),
-        fetch_sec_edgar(),
-        fetch_reddit_rss(),
-        fetch_indianapi(),
-        fetch_newsdata(),
+        fetch_newsapi(query=query),
+        #fetch_guardian(query=query),
+        fetch_rss(query=query),
+        #fetch_tiingo(query=query),
+        fetch_marketaux(query=query),
+        #fetch_stock_news_api(query=query),
+        fetch_apitube(query=query),
+        fetch_gnews(query=query),
+        fetch_finnhub(query=query),
+        fetch_sec_edgar(query=query),
+        fetch_reddit_rss(query=query),
+        fetch_indianapi(query=query),
+        fetch_newsdata(query=query),
     ]
+
 
     for source_gen in sources:
         for raw_article in source_gen:
