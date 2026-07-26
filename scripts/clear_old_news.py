@@ -9,9 +9,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-import certifi
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+
+from db import get_collection
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -30,20 +29,7 @@ MONGO_URI: str = os.getenv("MONGO_URI", "")
 MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "news_pipeline")
 MONGO_COLLECTION: str = os.getenv("MONGO_COLLECTION", "articles")
 
-def get_collection():
-    if not MONGO_URI:
-        log.critical("MONGO_URI is not set in .env — cannot connect to MongoDB.")
-        raise RuntimeError("MONGO_URI is not set in .env")
-
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
-        client.admin.command("ping")
-    except ConnectionFailure as exc:
-        log.critical("MongoDB connection failed: %s", exc)
-        raise RuntimeError(f"MongoDB connection failed: {exc}")
-
-    db = client[MONGO_DB_NAME]
-    return db[MONGO_COLLECTION]
+# MongoDB collection is provided by the shared singleton in db.py
 
 def run_cleanup(days_old: int = 15):
     log.info("=" * 60)

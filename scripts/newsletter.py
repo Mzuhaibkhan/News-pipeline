@@ -19,10 +19,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
-import certifi
 from dotenv import load_dotenv
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+
+from db import get_db, get_collection as get_articles_collection, get_subscribers_collection
 
 # ---------------------------------------------------------------------------
 # Environment Setup & Configuration
@@ -49,37 +48,7 @@ SMTP_USER: str = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
 EMAIL_FROM: str = os.getenv("EMAIL_FROM", SMTP_USER or "News Pipeline Digest <noreply@newspipeline.com>")
 
-# ---------------------------------------------------------------------------
-# MongoDB Connections & Operations
-# ---------------------------------------------------------------------------
-
-def get_db():
-    """Connect to MongoDB cluster and return database object."""
-    if not MONGO_URI:
-        log.critical("MONGO_URI is not set in environment.")
-        raise RuntimeError("MONGO_URI is not set in environment.")
-
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
-        client.admin.command("ping")
-        return client[MONGO_DB_NAME]
-    except ConnectionFailure as exc:
-        log.critical("MongoDB connection failed: %s", exc)
-        raise RuntimeError(f"MongoDB connection failed: {exc}")
-
-
-def get_subscribers_collection():
-    """Get the subscribers collection with an index on email."""
-    db = get_db()
-    collection = db[MONGO_SUBSCRIBERS_COLLECTION]
-    collection.create_index("email", unique=True)
-    return collection
-
-
-def get_articles_collection():
-    """Get the articles collection."""
-    db = get_db()
-    return db[MONGO_ARTICLES_COLLECTION]
+# MongoDB connections are provided by the shared singleton in db.py
 
 
 def subscribe_email(email: str) -> Dict[str, Any]:
