@@ -53,10 +53,7 @@ def trigger_fetch(company: str = Query(None, description="Optional company name 
         }
     except Exception as e:
         log.error(f"Error during fetch: {e}")
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/articles")
 def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(None, description="Max number of articles to return")) -> Dict[str, Any]:
@@ -73,10 +70,7 @@ def get_articles(company: str = Query(None, description="Optional company name o
         }
     except Exception as e:
         log.error(f"Error fetching saved articles: {e}")
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/cleanup")
 def trigger_cleanup(days_old: int = Query(15, description="Number of days old before deleting")) -> Dict[str, str]:
@@ -88,7 +82,7 @@ def trigger_cleanup(days_old: int = Query(15, description="Number of days old be
         return {"status": "success", "message": f"Cleared articles older than {days_old} days"}
     except Exception as e:
         log.error(f"Error during cleanup: {e}")
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
 # Newsletter & Email Endpoints

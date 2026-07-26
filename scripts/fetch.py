@@ -34,16 +34,17 @@ from typing import Any, Generator
 
 import feedparser
 import nltk
-import certifi
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from dotenv import load_dotenv
 from langdetect import LangDetectException, detect
-from pymongo import MongoClient, UpdateOne
-from pymongo.errors import BulkWriteError, ConnectionFailure
+from pymongo import UpdateOne
+from pymongo.errors import BulkWriteError
 from rake_nltk import Rake
 from textblob import TextBlob
+
+from db import get_collection
 
 # ---------------------------------------------------------------------------
 # Retry Session Factory
@@ -782,36 +783,7 @@ def fetch_newsdata(query: str | None = None) -> Generator[dict[str, Any], None, 
         log.error(f"Error fetching NewsData.io: {e}")
 
 
-# ---------------------------------------------------------------------------
-# MongoDB
-# ---------------------------------------------------------------------------
-
-def get_collection():
-    """Return the MongoDB collection, raising on connection failure."""
-    if not MONGO_URI:
-        log.critical("MONGO_URI is not set in .env — cannot connect to MongoDB.")
-        raise RuntimeError("MONGO_URI is not set in .env")
-
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
-        client.admin.command("ping")  # fail-fast connectivity check
-        log.info("Connected to MongoDB cluster.")
-    except ConnectionFailure as exc:
-        log.critical("MongoDB connection failed: %s", exc)
-        raise RuntimeError(f"MongoDB connection failed: {exc}")
-
-    db = client[MONGO_DB_NAME]
-    collection = db[MONGO_COLLECTION]
-
-    # Ensure indexes
-    collection.create_index("url_hash", unique=True, background=True)
-    collection.create_index("published_at", background=True)
-    collection.create_index("source", background=True)
-    collection.create_index("category", background=True)
-    collection.create_index([("title", "text"), ("description", "text"), ("keywords", "text")],
-                            background=True)
-    log.info("Indexes ensured on collection '%s'.", MONGO_COLLECTION)
-    return collection
+# MongoDB collection is provided by the shared singleton in db.py
 
 
 def upsert_articles(collection, articles: list[dict[str, Any]]) -> tuple[int, int, int]:
