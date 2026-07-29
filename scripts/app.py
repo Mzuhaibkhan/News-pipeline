@@ -2,6 +2,8 @@ from fastapi import FastAPI, BackgroundTasks, Query, HTTPException
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
 import logging
+import time
+import threading
 
 import fetch
 import clear_old_news
@@ -14,6 +16,55 @@ app = FastAPI(
 )
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# In-Memory Cache (Thread-Safe with TTL)
+# ---------------------------------------------------------------------------
+class InMemoryCache:
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            val, expiry = self._cache[key]
+            if time.time() > expiry:
+                del self._cache[key]
+                return None
+            return val
+
+    def set(self, key: str, value: Any, ttl: int = 60):
+        with self._lock:
+            self._cache[key] = (value, time.time() + ttl)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            log.info("In-memory cache cleared.")
+
+cache = InMemoryCache()
+
+
+# ---------------------------------------------------------------------------
+# Background Task Tracking and Locking
+# ---------------------------------------------------------------------------
+_active_fetches = set()
+_fetch_lock = threading.Lock()
+
+def _run_pipeline_background(company: Optional[str]):
+    """Background task function to execute the pipeline fetch and clear cache on success."""
+    key = company if company is not None else "__all__"
+    try:
+        fetch.run_pipeline(return_data=False, query=company)
+    except Exception as e:
+        log.error(f"Background fetch error for {company or 'all'}: {e}")
+    finally:
+        with _fetch_lock:
+            _active_fetches.discard(key)
+        cache.clear()
 
 
 # Pydantic Schemas for Requests
@@ -39,21 +90,26 @@ def read_root() -> Dict[str, str]:
 
 @app.post("/api/fetch")
 @app.get("/api/fetch")
-def trigger_fetch(company: str = Query(None, description="Optional company name or ticker to search for")) -> Dict[str, Any]:
+def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, description="Optional company name or ticker to search for")) -> Dict[str, Any]:
     """
-    Triggers the fetch pipeline, upserts to MongoDB, and returns the fetched articles.
+    Triggers the fetch pipeline in the background and returns immediately.
     If 'company' is provided, it specifically fetches articles related to that company.
     """
-    try:
-        articles = fetch.run_pipeline(return_data=True, query=company)
-        return {
-            "status": "success",
-            "fetched_count": len(articles),
-            "data": articles
-        }
-    except Exception as e:
-        log.error(f"Error during fetch: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    key = company if company is not None else "__all__"
+    
+    with _fetch_lock:
+        if key in _active_fetches:
+            return {
+                "status": "accepted",
+                "message": f"Fetch pipeline is already running for: {company or 'all'}. Please wait."
+            }
+        _active_fetches.add(key)
+        
+    background_tasks.add_task(_run_pipeline_background, company)
+    return {
+        "status": "accepted",
+        "message": f"Fetch pipeline triggered in background for: {company or 'all'}."
+    }
 
 @app.get("/api/articles")
 def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(None, description="Max number of articles to return")) -> Dict[str, Any]:
@@ -61,13 +117,21 @@ def get_articles(company: str = Query(None, description="Optional company name o
     Retrieves already fetched articles directly from the database without querying external APIs.
     This naturally skips any broken/revoked external APIs.
     """
+    cache_key = f"articles:{company or 'all'}:{limit or 'default'}"
+    cached_val = cache.get(cache_key)
+    if cached_val is not None:
+        return cached_val
+
     try:
         articles = fetch.get_saved_articles(query=company, limit=limit)
-        return {
+        response_data = {
             "status": "success",
             "count": len(articles),
             "data": articles
         }
+        # Cache for 60 seconds
+        cache.set(cache_key, response_data, ttl=60)
+        return response_data
     except Exception as e:
         log.error(f"Error fetching saved articles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
