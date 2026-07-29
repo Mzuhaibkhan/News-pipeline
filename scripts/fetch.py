@@ -176,11 +176,11 @@ def _sentiment(text: str) -> dict[str, float]:
     }
 
 
-def _keywords(text: str, max_keywords: int = 10) -> list[str]:
+def _keywords(text: str, max_keywords: int = 10, rake: Rake | None = None) -> list[str]:
     """Extract top keywords using RAKE."""
     if not text.strip():
         return []
-    r = Rake()
+    r = rake or Rake()
     r.extract_keywords_from_text(text[:2000])
     ranked = r.get_ranked_phrases()
     return ranked[:max_keywords]
@@ -191,7 +191,7 @@ def _url_hash(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()
 
 
-def enrich(article: dict[str, Any]) -> dict[str, Any]:
+def enrich(article: dict[str, Any], rake: Rake | None = None) -> dict[str, Any]:
     """Add language, sentiment, and keywords to an article dict in-place."""
     combined_text = " ".join(filter(None, [
         article.get("title", ""),
@@ -200,7 +200,7 @@ def enrich(article: dict[str, Any]) -> dict[str, Any]:
     ]))
     article["language"] = _detect_language(combined_text)
     article["sentiment"] = _sentiment(combined_text)
-    article["keywords"] = _keywords(combined_text)
+    article["keywords"] = _keywords(combined_text, rake=rake)
     return article
 
 
@@ -867,10 +867,11 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
     ]
 
 
+    rake = Rake()
     for source_gen in sources:
         for raw_article in source_gen:
             try:
-                enriched = enrich(raw_article)
+                enriched = enrich(raw_article, rake=rake)
                 batch.append(enriched)
                 if len(batch) >= BATCH_SIZE:
                     flush_batch()
