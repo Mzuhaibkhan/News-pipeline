@@ -137,8 +137,8 @@ def fetch_todays_news(limit: int = 10, company: Optional[str] = None) -> List[Di
     # Query for recent articles
     query: Dict[str, Any] = {
         "$or": [
-            {"published_at": {"$gte": start_of_day.isoformat()}},
-            {"fetched_at": {"$gte": start_of_day.isoformat()}}
+            {"published_at": {"$gte": start_of_day}},
+            {"fetched_at": {"$gte": start_of_day}}
         ]
     }
     
