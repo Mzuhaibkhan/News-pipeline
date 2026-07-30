@@ -5,6 +5,10 @@ import logging
 import time
 import threading
 
+import os
+import json
+import redis
+
 import fetch
 import clear_old_news
 import newsletter
@@ -19,7 +23,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# In-Memory Cache (Thread-Safe with TTL)
+# Caching Layer (Redis Distributed Cache with InMemory Fallback)
 # ---------------------------------------------------------------------------
 class InMemoryCache:
     def __init__(self):
@@ -45,7 +49,57 @@ class InMemoryCache:
             self._cache.clear()
             log.info("In-memory cache cleared.")
 
-cache = InMemoryCache()
+
+class RedisCache:
+    def __init__(self, redis_url: str):
+        self._url = redis_url
+        self._client = redis.Redis.from_url(
+            redis_url, 
+            socket_timeout=2.0, 
+            socket_connect_timeout=2.0
+        )
+        # Ping check to fail fast if connection cannot be established
+        self._client.ping()
+
+    def get(self, key: str) -> Optional[Any]:
+        try:
+            val = self._client.get(key)
+            if val is not None:
+                return json.loads(val)
+        except Exception as e:
+            log.error("Redis cache error on get: %s", e)
+        return None
+
+    def set(self, key: str, value: Any, ttl: int = 60):
+        try:
+            self._client.setex(key, ttl, json.dumps(value))
+        except Exception as e:
+            log.error("Redis cache error on set: %s", e)
+
+    def clear(self):
+        try:
+            self._client.flushdb()
+            log.info("Redis cache cleared (flushdb).")
+        except Exception as e:
+            log.error("Redis cache error on clear: %s", e)
+
+
+def get_cache():
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        try:
+            log.info("Attempting to connect to Redis cache at %s...", redis_url)
+            redis_cache = RedisCache(redis_url)
+            log.info("Successfully connected to Redis cache.")
+            return redis_cache
+        except Exception as e:
+            log.warning("Failed to connect to Redis. Falling back to InMemoryCache. Error: %s", e)
+    else:
+        log.info("REDIS_URL not configured. Using InMemoryCache.")
+    return InMemoryCache()
+
+
+cache = get_cache()
 
 
 # ---------------------------------------------------------------------------
