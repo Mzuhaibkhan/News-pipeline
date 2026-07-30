@@ -56,9 +56,13 @@ def get_client() -> MongoClient:
                 MONGO_URI,
                 serverSelectionTimeoutMS=10_000,
                 tlsCAFile=certifi.where(),
+                # --- Connection pool tuning for high concurrency ---
+                maxPoolSize=200,        # support 200 concurrent DB ops per worker
+                minPoolSize=10,         # keep 10 connections warm to avoid setup overhead
+                maxIdleTimeMS=45_000,   # reclaim idle connections after 45s
             )
             client.admin.command("ping")  # fail-fast connectivity check
-            log.info("Connected to MongoDB cluster (singleton client).")
+            log.info("Connected to MongoDB cluster (singleton client, pool=200).")
         except ConnectionFailure as exc:
             log.critical("MongoDB connection failed: %s", exc)
             raise RuntimeError(f"MongoDB connection failed: {exc}")
@@ -79,6 +83,10 @@ def get_collection():
     """
     db = get_db()
     collection = db[MONGO_COLLECTION]
+
+    # Fast path: skip lock entirely after first initialization
+    if "articles" in _indexes_ensured:
+        return collection
 
     with _indexes_lock:
         if "articles" not in _indexes_ensured:
@@ -104,6 +112,10 @@ def get_subscribers_collection():
     db = get_db()
     collection = db[MONGO_SUBSCRIBERS_COLLECTION]
 
+    # Fast path: skip lock entirely after first initialization
+    if "subscribers" in _indexes_ensured:
+        return collection
+
     with _indexes_lock:
         if "subscribers" not in _indexes_ensured:
             collection.create_index("email", unique=True)
@@ -111,3 +123,15 @@ def get_subscribers_collection():
             _indexes_ensured.add("subscribers")
 
     return collection
+
+
+def ensure_all_indexes():
+    """
+    Pre-warm the database connection and ensure all indexes exist.
+    Call this once at application startup so that no request ever pays
+    the index-creation cost or contends on the indexes lock.
+    """
+    log.info("Pre-warming MongoDB connection and ensuring indexes...")
+    get_collection()
+    get_subscribers_collection()
+    log.info("All indexes ensured and connection pre-warmed.")
