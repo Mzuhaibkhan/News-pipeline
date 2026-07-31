@@ -903,38 +903,21 @@ def get_saved_articles(query: str | None = None, limit: int | None = None) -> li
     """Retrieve already fetched articles from MongoDB."""
     collection = get_collection()
     
+    # Enforce a sane default limit to prevent loading the entire collection
+    # into memory when no limit is specified by the caller.
+    effective_limit = limit if (limit is not None and limit > 0) else 200
+    
     # Exclude _id to make it easily JSON serializable
     projection = {"_id": 0}
     
     if query:
-        # Use MongoDB text search if possible, else fallback to regex
-        # We already have a text index on title, description, keywords
+        # Use MongoDB text search (backed by text index on title, description, keywords)
         db_filter = {"$text": {"$search": query}}
-        cursor = collection.find(db_filter, projection).sort([("published_at", -1)])
+        cursor = collection.find(db_filter, projection).sort([("published_at", -1)]).limit(effective_limit)
     else:
-        cursor = collection.find({}, projection).sort([("published_at", -1)])
-        
-    if limit is not None and limit > 0:
-        cursor = cursor.limit(limit)
+        cursor = collection.find({}, projection).sort([("published_at", -1)]).limit(effective_limit)
         
     articles = list(cursor)
-    
-    # If text search returned nothing, fallback to regex search for safety
-    if query and not articles:
-        regex_filter = {
-            "$or": [
-                {"title": {"$regex": query, "$options": "i"}},
-                {"description": {"$regex": query, "$options": "i"}},
-                {"content": {"$regex": query, "$options": "i"}},
-                {"category": {"$regex": query, "$options": "i"}},
-                {"keywords": {"$regex": query, "$options": "i"}}
-            ]
-        }
-        cursor = collection.find(regex_filter, projection).sort([("published_at", -1)])
-        if limit is not None and limit > 0:
-            cursor = cursor.limit(limit)
-        articles = list(cursor)
-        
     return articles
 
 
