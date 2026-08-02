@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Generator
 
@@ -820,8 +821,18 @@ def upsert_articles(collection, articles: list[dict[str, Any]]) -> tuple[int, in
 # Pipeline orchestrator
 # ---------------------------------------------------------------------------
 
+def _fetch_source(source_fn, query: str | None) -> list[dict[str, Any]]:
+    """Wrapper to collect all articles from a single source generator.
+    Runs inside a ThreadPoolExecutor worker so sources fetch in parallel."""
+    try:
+        return list(source_fn(query=query))
+    except Exception as exc:
+        log.error("Source %s failed: %s", getattr(source_fn, "__name__", "unknown"), exc)
+        return []
+
+
 def run_pipeline(return_data: bool = False, query: str | None = None) -> list[dict[str, Any]] | None:
-    """Main entry point: fetch → enrich → upsert."""
+    """Main entry point: fetch (parallel) → enrich → upsert."""
     log.info("=" * 60)
     log.info("News Pipeline starting at %s (query=%s)", datetime.now(timezone.utc).isoformat(), query)
     log.info("=" * 60)
@@ -849,34 +860,52 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
         )
         batch = []
 
-    # Chain all sources with query parameter propagation
-    sources = [
-        fetch_newsapi(query=query),
-        #fetch_guardian(query=query),
-        fetch_rss(query=query),
-        #fetch_tiingo(query=query),
-        fetch_marketaux(query=query),
-        #fetch_stock_news_api(query=query),
-        fetch_apitube(query=query),
-        fetch_gnews(query=query),
-        fetch_finnhub(query=query),
-        fetch_sec_edgar(query=query),
-        fetch_reddit_rss(query=query),
-        fetch_indianapi(query=query),
-        fetch_newsdata(query=query),
+    # ---------------------------------------------------------------------------
+    # Parallel source fetching — all external APIs are hit concurrently.
+    # max_workers=8 balances parallelism vs. connection/memory pressure.
+    # ---------------------------------------------------------------------------
+    source_fns = [
+        fetch_newsapi,
+        #fetch_guardian,
+        fetch_rss,
+        #fetch_tiingo,
+        fetch_marketaux,
+        #fetch_stock_news_api,
+        fetch_apitube,
+        fetch_gnews,
+        fetch_finnhub,
+        fetch_sec_edgar,
+        fetch_reddit_rss,
+        fetch_indianapi,
+        fetch_newsdata,
     ]
 
+    all_raw_articles: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_source, fn, query): fn.__name__
+            for fn in source_fns
+        }
+        for future in as_completed(futures):
+            source_name = futures[future]
+            try:
+                articles = future.result()
+                log.info("Source %s returned %d articles.", source_name, len(articles))
+                all_raw_articles.extend(articles)
+            except Exception as exc:
+                log.error("Source %s raised: %s", source_name, exc)
+
+    log.info("Total raw articles from all sources: %d", len(all_raw_articles))
 
     rake = Rake()
-    for source_gen in sources:
-        for raw_article in source_gen:
-            try:
-                enriched = enrich(raw_article, rake=rake)
-                batch.append(enriched)
-                if len(batch) >= BATCH_SIZE:
-                    flush_batch()
-            except Exception as exc:
-                log.warning("Enrichment error for %s: %s", raw_article.get("url"), exc)
+    for raw_article in all_raw_articles:
+        try:
+            enriched = enrich(raw_article, rake=rake)
+            batch.append(enriched)
+            if len(batch) >= BATCH_SIZE:
+                flush_batch()
+        except Exception as exc:
+            log.warning("Enrichment error for %s: %s", raw_article.get("url"), exc)
 
     flush_batch()  # final flush
 
@@ -899,26 +928,48 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
         return all_fetched
 
 
-def get_saved_articles(query: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-    """Retrieve already fetched articles from MongoDB."""
+def get_saved_articles(
+    query: str | None = None,
+    limit: int | None = None,
+    skip: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Retrieve already fetched articles from MongoDB.
+
+    Returns a tuple of (articles_list, total_matching_count) to support
+    pagination in the API layer.
+    """
     collection = get_collection()
-    
+
     # Enforce a sane default limit to prevent loading the entire collection
     # into memory when no limit is specified by the caller.
-    effective_limit = limit if (limit is not None and limit > 0) else 200
-    
-    # Exclude _id to make it easily JSON serializable
-    projection = {"_id": 0}
-    
+    effective_limit = limit if (limit is not None and limit > 0) else 20
+
+    # Lean projection — exclude heavy fields that the list endpoint doesn't need.
+    # Clients can fetch full content via a future /api/articles/<id> endpoint.
+    projection = {
+        "_id": 0,
+        "content": 0,
+        "url_hash": 0,
+        "created_at": 0,
+        "fetched_at": 0,
+    }
+
     if query:
         # Use MongoDB text search (backed by text index on title, description, keywords)
         db_filter = {"$text": {"$search": query}}
-        cursor = collection.find(db_filter, projection).sort([("published_at", -1)]).limit(effective_limit)
     else:
-        cursor = collection.find({}, projection).sort([("published_at", -1)]).limit(effective_limit)
-        
+        db_filter = {}
+
+    total = collection.count_documents(db_filter)
+    cursor = (
+        collection.find(db_filter, projection)
+        .sort([("published_at", -1)])
+        .skip(skip)
+        .limit(effective_limit)
+    )
+
     articles = list(cursor)
-    return articles
+    return articles, total
 
 
 if __name__ == "__main__":
