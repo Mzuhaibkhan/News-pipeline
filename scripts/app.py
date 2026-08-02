@@ -261,41 +261,68 @@ def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, 
     }
 
 @app.get("/api/articles")
-def get_articles(company: str = Query(None, description="Optional company name or ticker to filter by"), limit: int = Query(None, description="Max number of articles to return")) -> Dict[str, Any]:
+def get_articles(
+    company: str = Query(None, description="Optional company name or ticker to filter by"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
+) -> Dict[str, Any]:
     """
-    Retrieves already fetched articles directly from the database without querying external APIs.
+    Retrieves already fetched articles directly from the database with pagination.
     This naturally skips any broken/revoked external APIs.
     """
-    cache_key = f"articles:{company or 'all'}:{limit or 'default'}"
+    cache_key = f"articles:{company or 'all'}:p{page}:pp{per_page}"
     cached_val = cache.get(cache_key)
     if cached_val is not None:
         return cached_val
 
     try:
-        articles = fetch.get_saved_articles(query=company, limit=limit)
+        skip = (page - 1) * per_page
+        articles, total = fetch.get_saved_articles(
+            query=company, limit=per_page, skip=skip
+        )
+        total_pages = max(1, -(-total // per_page))  # ceiling division
         response_data = {
             "status": "success",
             "count": len(articles),
-            "data": articles
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "data": articles,
         }
-        # Cache for 60 seconds
-        cache.set(cache_key, response_data, ttl=60)
+        # Cache for 5 minutes — articles don't change frequently;
+        # cache is invalidated automatically when the fetch pipeline completes.
+        cache.set(cache_key, response_data, ttl=300)
         return response_data
     except Exception as e:
         log.error(f"Error fetching saved articles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/cleanup")
-def trigger_cleanup(days_old: int = Query(15, description="Number of days old before deleting")) -> Dict[str, str]:
-    """
-    Triggers cleanup of old articles from MongoDB.
-    """
+def _run_cleanup_background(days_old: int):
+    """Background task function for article cleanup."""
     try:
         clear_old_news.run_cleanup(days_old=days_old)
-        return {"status": "success", "message": f"Cleared articles older than {days_old} days"}
+        log.info("Background cleanup completed for articles older than %d days.", days_old)
     except Exception as e:
-        log.error(f"Error during cleanup: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Background cleanup error: %s", e)
+    finally:
+        cache.clear()
+
+
+@app.post("/api/cleanup", status_code=202)
+def trigger_cleanup(
+    background_tasks: BackgroundTasks,
+    days_old: int = Query(15, description="Number of days old before deleting"),
+) -> Dict[str, str]:
+    """
+    Triggers cleanup of old articles from MongoDB in the background.
+    Returns immediately with 202 Accepted.
+    """
+    background_tasks.add_task(_run_cleanup_background, days_old)
+    return {
+        "status": "accepted",
+        "message": f"Cleanup triggered in background for articles older than {days_old} days.",
+    }
 
 # ---------------------------------------------------------------------------
 # Newsletter & Email Endpoints
