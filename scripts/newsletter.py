@@ -135,7 +135,7 @@ def fetch_todays_news(limit: int = 10, company: Optional[str] = None) -> List[Di
     start_of_day = now - timedelta(hours=24)
     
     # Query for recent articles
-    query: Dict[str, Any] = {
+    time_filter: Dict[str, Any] = {
         "$or": [
             {"published_at": {"$gte": start_of_day}},
             {"fetched_at": {"$gte": start_of_day}}
@@ -143,15 +143,12 @@ def fetch_todays_news(limit: int = 10, company: Optional[str] = None) -> List[Di
     }
     
     if company:
-        query_lower = company.lower()
-        company_filter = {
-            "$or": [
-                {"title": {"$regex": query_lower, "$options": "i"}},
-                {"description": {"$regex": query_lower, "$options": "i"}},
-                {"keywords": {"$regex": query_lower, "$options": "i"}}
-            ]
-        }
-        query = {"$and": [query, company_filter]}
+        # Use $text search (backed by text index on title, description, keywords)
+        # instead of $regex which cannot use indexes and triggers collection scans.
+        company_filter: Dict[str, Any] = {"$text": {"$search": company}}
+        query: Dict[str, Any] = {"$and": [time_filter, company_filter]}
+    else:
+        query = time_filter
 
     cursor = collection.find(query, {"_id": 0}).sort([("published_at", -1)]).limit(limit)
     articles = list(cursor)
@@ -159,15 +156,10 @@ def fetch_todays_news(limit: int = 10, company: Optional[str] = None) -> List[Di
     # Fallback to absolute latest articles if past 24 hours has no items
     if not articles:
         log.info("No articles found in past 24h, falling back to latest stored articles.")
-        fallback_query = {}
         if company:
-            fallback_query = {
-                "$or": [
-                    {"title": {"$regex": company, "$options": "i"}},
-                    {"description": {"$regex": company, "$options": "i"}},
-                    {"keywords": {"$regex": company, "$options": "i"}}
-                ]
-            }
+            fallback_query: Dict[str, Any] = {"$text": {"$search": company}}
+        else:
+            fallback_query = {}
         cursor = collection.find(fallback_query, {"_id": 0}).sort([("published_at", -1)]).limit(limit)
         articles = list(cursor)
 
@@ -371,6 +363,8 @@ def send_todays_news_email(
 def broadcast_newsletter(limit: int = 10, company: Optional[str] = None) -> Dict[str, Any]:
     """
     Dispatches today's news newsletter to all active subscribers in MongoDB.
+    Reuses a single SMTP connection for all recipients to avoid per-email
+    TCP + TLS handshake overhead.
     """
     subscribers = get_active_subscribers()
     if not subscribers:
@@ -390,22 +384,60 @@ def broadcast_newsletter(limit: int = 10, company: Optional[str] = None) -> Dict
         }
 
     date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
-    subject = f"📰 Today's News Digest - {date_str}"
+    subject = f"\U0001f4f0 Today's News Digest - {date_str}"
+
+    if not SMTP_USER or not SMTP_PASSWORD:
+        log.critical("SMTP_USER or SMTP_PASSWORD is not configured — cannot broadcast.")
+        return {
+            "status": "error",
+            "message": "SMTP credentials missing.",
+            "sent_count": 0,
+        }
 
     sent_count = 0
     failed_count = 0
     errors = []
 
-    for email in subscribers:
+    # Open ONE SMTP connection and reuse it for every subscriber.
+    try:
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15)
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+    except Exception as exc:
+        log.error("Failed to open SMTP connection for broadcast: %s", exc)
+        return {
+            "status": "error",
+            "message": f"SMTP connection failed: {exc}",
+            "sent_count": 0,
+        }
+
+    try:
+        for email in subscribers:
+            try:
+                html_content = render_html_newsletter(articles, recipient_email=email)
+                text_content = render_text_newsletter(articles)
+
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = EMAIL_FROM
+                msg["To"] = email
+                msg.attach(MIMEText(text_content, "plain"))
+                msg.attach(MIMEText(html_content, "html"))
+
+                server.sendmail(EMAIL_FROM, [email], msg.as_string())
+                sent_count += 1
+            except Exception as exc:
+                log.error("Failed to send newsletter to %s: %s", email, exc)
+                failed_count += 1
+                errors.append({"email": email, "error": str(exc)})
+    finally:
         try:
-            html_content = render_html_newsletter(articles, recipient_email=email)
-            text_content = render_text_newsletter(articles)
-            send_email(to_email=email, subject=subject, html_content=html_content, text_content=text_content)
-            sent_count += 1
-        except Exception as exc:
-            log.error("Failed to send newsletter to %s: %s", email, exc)
-            failed_count += 1
-            errors.append({"email": email, "error": str(exc)})
+            server.quit()
+        except Exception:
+            pass
 
     return {
         "status": "success",
