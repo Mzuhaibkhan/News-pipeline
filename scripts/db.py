@@ -91,9 +91,11 @@ def get_collection():
     with _indexes_lock:
         if "articles" not in _indexes_ensured:
             collection.create_index("url_hash", unique=True, background=True)
-            collection.create_index("published_at", background=True)
+            collection.create_index([("published_at", -1)], background=True)
             collection.create_index("source", background=True)
             collection.create_index("category", background=True)
+            collection.create_index([("category", 1), ("published_at", -1)], background=True)
+            collection.create_index([("source", 1), ("published_at", -1)], background=True)
             collection.create_index(
                 [("title", "text"), ("description", "text"), ("keywords", "text")],
                 background=True,
