@@ -957,10 +957,10 @@ def get_saved_articles(
     if query:
         # Use MongoDB text search (backed by text index on title, description, keywords)
         db_filter = {"$text": {"$search": query}}
+        total = collection.count_documents(db_filter)
     else:
         db_filter = {}
-
-    total = collection.count_documents(db_filter)
+        total = collection.estimated_document_count()
     cursor = (
         collection.find(db_filter, projection)
         .sort([("published_at", -1)])
