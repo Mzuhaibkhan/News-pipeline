@@ -64,7 +64,11 @@ def get_retry_session(
         status_forcelist=status_forcelist,
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=20,
+        pool_maxsize=20,
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -150,8 +154,8 @@ RSS_FEEDS: dict[str, str] = {
     "MIT Tech Review": "https://www.technologyreview.com/feed/",
 }
 
-REQUEST_TIMEOUT: int = 15  # seconds
-REQUEST_DELAY: float = 0.3  # polite delay between API calls
+REQUEST_TIMEOUT: tuple[int, int] = (5, 10)  # (connect, read) timeout in seconds
+REQUEST_DELAY: float = 0.0  # removed: retry backoff handles rate-limiting
 
 
 # ---------------------------------------------------------------------------
@@ -280,48 +284,54 @@ def fetch_newsapi(query: str | None = None) -> Generator[dict[str, Any], None, N
             }
         return
 
-    base_url = "https://newsapi.org/v2/top-headlines"
-    for country in NEWSAPI_COUNTRIES:
-        for category in NEWSAPI_CATEGORIES:
-            params = {
-                "country": country,
-                "category": category,
-                "pageSize": NEWSAPI_PAGE_SIZE,
-            }
-            try:
-                resp = http_session.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
-            except requests.RequestException as exc:
-                log.error("NewsAPI request failed for country=%s category=%s: %s", country, category, exc)
-                time.sleep(REQUEST_DELAY)
+    # --- Headlines mode: fetch all country/category combos in parallel ---
+    def _fetch_headlines(combo):
+        country, category = combo
+        params = {
+            "country": country,
+            "category": category,
+            "pageSize": NEWSAPI_PAGE_SIZE,
+        }
+        try:
+            resp = http_session.get(
+                "https://newsapi.org/v2/top-headlines",
+                params=params, headers=headers, timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            log.error("NewsAPI request failed for country=%s category=%s: %s", country, category, exc)
+            return []
+
+        raw_articles = data.get("articles", [])
+        log.info("NewsAPI [%s-%s] → %d articles", country, category, len(raw_articles))
+
+        results = []
+        for raw in raw_articles:
+            url = (raw.get("url") or "").strip()
+            if not url or url == "https://removed.com":
                 continue
+            source_name = (raw.get("source") or {}).get("name", "NewsAPI")
+            results.append({
+                "url": url,
+                "url_hash": _url_hash(url),
+                "source": source_name,
+                "source_type": "newsapi",
+                "category": category,
+                "title": (raw.get("title") or "").strip(),
+                "description": (raw.get("description") or "").strip(),
+                "content": (raw.get("content") or "").strip(),
+                "author": (raw.get("author") or "").strip(),
+                "image_url": raw.get("urlToImage"),
+                "published_at": _parse_dt(raw.get("publishedAt")),
+                "fetched_at": datetime.now(timezone.utc),
+            })
+        return results
 
-            articles = data.get("articles", [])
-            log.info("NewsAPI [%s-%s] → %d articles", country, category, len(articles))
-
-            for raw in articles:
-                url = (raw.get("url") or "").strip()
-                if not url or url == "https://removed.com":
-                    continue
-
-                source_name = (raw.get("source") or {}).get("name", "NewsAPI")
-                yield {
-                    "url": url,
-                    "url_hash": _url_hash(url),
-                    "source": source_name,
-                    "source_type": "newsapi",
-                    "category": category,
-                    "title": (raw.get("title") or "").strip(),
-                    "description": (raw.get("description") or "").strip(),
-                    "content": (raw.get("content") or "").strip(),
-                    "author": (raw.get("author") or "").strip(),
-                    "image_url": raw.get("urlToImage"),
-                    "published_at": _parse_dt(raw.get("publishedAt")),
-                    "fetched_at": datetime.now(timezone.utc),
-                }
-
-            time.sleep(REQUEST_DELAY)
+    combos = [(c, cat) for c in NEWSAPI_COUNTRIES for cat in NEWSAPI_CATEGORIES]
+    with ThreadPoolExecutor(max_workers=len(combos)) as pool:
+        for batch_result in pool.map(_fetch_headlines, combos):
+            yield from batch_result
 
 
 def fetch_guardian(query: str | None = None) -> Generator[dict[str, Any], None, None]:
@@ -382,17 +392,21 @@ def fetch_guardian(query: str | None = None) -> Generator[dict[str, Any], None, 
 
 
 def fetch_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]:
-    """Yield articles from all configured RSS feeds."""
+    """Yield articles from all configured RSS feeds in parallel."""
     query_lower = query.lower() if query else None
-    for feed_name, feed_url in RSS_FEEDS.items():
+
+    def _fetch_single_feed(args):
+        """Parse a single RSS feed and return matching articles."""
+        feed_name, feed_url = args
         try:
             parsed = feedparser.parse(feed_url)
         except Exception as exc:
             log.error("RSS parse error for %s: %s", feed_name, exc)
-            continue
+            return []
 
         entries = parsed.get("entries", [])
         log.info("RSS [%s] → %d entries", feed_name, len(entries))
+        results = []
 
         for entry in entries:
             url = (
@@ -463,7 +477,7 @@ def fetch_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]
             if entry.get("tags"):
                 category = entry["tags"][0].get("term", "")
 
-            yield {
+            results.append({
                 "url": url,
                 "url_hash": _url_hash(url),
                 "source": feed_name,
@@ -476,9 +490,13 @@ def fetch_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]
                 "image_url": image_url,
                 "published_at": published_at,
                 "fetched_at": datetime.now(timezone.utc),
-            }
+            })
 
-        time.sleep(REQUEST_DELAY)
+        return results
+
+    with ThreadPoolExecutor(max_workers=len(RSS_FEEDS)) as pool:
+        for batch_result in pool.map(_fetch_single_feed, RSS_FEEDS.items()):
+            yield from batch_result
 
 
 
@@ -881,7 +899,7 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
     ]
 
     all_raw_articles: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=len(source_fns)) as executor:
         futures = {
             executor.submit(_fetch_source, fn, query): fn.__name__
             for fn in source_fns
@@ -897,15 +915,21 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
 
     log.info("Total raw articles from all sources: %d", len(all_raw_articles))
 
-    rake = Rake()
-    for raw_article in all_raw_articles:
+    # --- Parallel enrichment: NLP ops run across multiple threads ---
+    def _enrich_single(article):
+        r = Rake()  # Rake is not thread-safe; create one per call
         try:
-            enriched = enrich(raw_article, rake=rake)
-            batch.append(enriched)
-            if len(batch) >= BATCH_SIZE:
-                flush_batch()
+            return enrich(article, rake=r)
         except Exception as exc:
-            log.warning("Enrichment error for %s: %s", raw_article.get("url"), exc)
+            log.warning("Enrichment error for %s: %s", article.get("url"), exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as enrich_pool:
+        for enriched in enrich_pool.map(_enrich_single, all_raw_articles):
+            if enriched is not None:
+                batch.append(enriched)
+                if len(batch) >= BATCH_SIZE:
+                    flush_batch()
 
     flush_batch()  # final flush
 
