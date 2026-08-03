@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, Query, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Query, HTTPException, Response
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
@@ -20,6 +20,7 @@ import newsletter
 # ---------------------------------------------------------------------------
 try:
     import orjson
+    from fastapi.responses import ORJSONResponse
 
     def _json_dumps(obj: Any) -> bytes:
         return orjson.dumps(obj, default=str)
@@ -29,6 +30,7 @@ try:
 
 except ImportError:
     import json
+    from fastapi.responses import JSONResponse as ORJSONResponse
 
     def _json_dumps(obj: Any) -> bytes:
         return json.dumps(obj, default=str).encode()
@@ -64,8 +66,9 @@ class InMemoryCache:
             return None
         val, expiry = entry
         if time.time() > expiry:
-            # Expired — lazy cleanup, no lock needed for correctness
-            self._cache.pop(key, None)
+            # Expired — thread-safe cleanup
+            with self._lock:
+                self._cache.pop(key, None)
             return None
         return val
 
@@ -169,6 +172,7 @@ app = FastAPI(
     title="News Pipeline API",
     description="API for fetching, storing, and emailing daily news newsletters from various sources.",
     version="2.0.0",
+    default_response_class=ORJSONResponse,
     lifespan=lifespan,
 )
 
@@ -260,8 +264,10 @@ def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, 
         "message": f"Fetch pipeline triggered in background for: {company or 'all'}."
     }
 
+
 @app.get("/api/articles")
 def get_articles(
+    response: Response,
     company: str = Query(None, description="Optional company name or ticker to filter by"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
@@ -270,6 +276,7 @@ def get_articles(
     Retrieves already fetched articles directly from the database with pagination.
     This naturally skips any broken/revoked external APIs.
     """
+    response.headers["Cache-Control"] = "public, max-age=60, s-maxage=300, stale-while-revalidate=60"
     cache_key = f"articles:{company or 'all'}:p{page}:pp{per_page}"
     cached_val = cache.get(cache_key)
     if cached_val is not None:
