@@ -14,7 +14,8 @@ import threading
 
 import certifi
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import MongoClient, ReadPreference
 from pymongo.errors import ConnectionFailure
 
 load_dotenv()
@@ -137,3 +138,58 @@ def ensure_all_indexes():
     get_collection()
     get_subscribers_collection()
     log.info("All indexes ensured and connection pre-warmed.")
+
+
+# ---------------------------------------------------------------------------
+# Async Motor client (for high-concurrency read endpoints)
+# ---------------------------------------------------------------------------
+
+_async_client: AsyncIOMotorClient | None = None
+_async_client_lock = threading.Lock()
+
+
+def get_async_client() -> AsyncIOMotorClient:
+    """Return a lazily-initialized, reusable async Motor client singleton.
+
+    Motor wraps PyMongo with an async API, so every `await collection.find()`
+    yields control back to the event-loop instead of blocking a threadpool
+    slot.  This lets a single Uvicorn worker handle thousands of in-flight
+    MongoDB reads concurrently.
+    """
+    global _async_client
+    if _async_client is not None:
+        return _async_client
+
+    with _async_client_lock:
+        if _async_client is not None:
+            return _async_client
+
+        if not MONGO_URI:
+            raise RuntimeError("MONGO_URI is not set in .env")
+
+        _async_client = AsyncIOMotorClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=10_000,
+            tlsCAFile=certifi.where(),
+            maxPoolSize=200,
+            minPoolSize=10,
+            maxIdleTimeMS=45_000,
+        )
+        log.info("Async Motor client initialized (pool=200).")
+        return _async_client
+
+
+def get_async_db():
+    """Return the application database via the async Motor client."""
+    return get_async_client()[MONGO_DB_NAME]
+
+
+def get_async_collection(read_pref=ReadPreference.SECONDARY_PREFERRED):
+    """Return the *articles* collection via the async Motor client.
+
+    Defaults to SECONDARY_PREFERRED read-preference so reads are
+    distributed across replica-set members instead of hammering
+    the primary node.
+    """
+    db = get_async_db()
+    return db.get_collection(MONGO_COLLECTION, read_preference=read_pref)
