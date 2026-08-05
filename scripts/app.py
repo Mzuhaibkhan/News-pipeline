@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, Query, HTTPException, Response
+import asyncio
+from fastapi import FastAPI, BackgroundTasks, Query, HTTPException, Response, Request
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
@@ -10,9 +11,14 @@ import threading
 import os
 import redis
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 import fetch
 import clear_old_news
 import newsletter
+from db import get_async_client, get_async_collection, ensure_all_indexes
 
 # ---------------------------------------------------------------------------
 # Use orjson for fast JSON serialization (5-10x faster, handles datetime)
@@ -89,23 +95,24 @@ class RedisCache:
             redis_url,
             socket_timeout=2.0,
             socket_connect_timeout=2.0,
-            decode_responses=False,  # we handle bytes ourselves via orjson
+            decode_responses=False,
+            max_connections=50,  # explicit pool cap to prevent connection storms
         )
         # Ping check to fail fast if connection cannot be established
         self._client.ping()
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Optional[bytes]:
+        """Return raw cached bytes (caller is responsible for deserialization)."""
         try:
-            val = self._client.get(_CACHE_PREFIX + key)
-            if val is not None:
-                return _json_loads(val)
+            return self._client.get(_CACHE_PREFIX + key)
         except Exception as e:
             log.error("Redis cache error on get: %s", e)
         return None
 
-    def set(self, key: str, value: Any, ttl: int = 60):
+    def set(self, key: str, value: bytes, ttl: int = 60):
+        """Store pre-serialized bytes directly (no double-encoding)."""
         try:
-            self._client.setex(_CACHE_PREFIX + key, ttl, _json_dumps(value))
+            self._client.setex(_CACHE_PREFIX + key, ttl, value)
         except Exception as e:
             log.error("Redis cache error on set: %s", e)
 
@@ -149,22 +156,29 @@ cache = _init_cache()
 @asynccontextmanager
 async def lifespan(app):
     """
-    Startup: pre-warm MongoDB connection, ensure indexes, expand threadpool.
-    Shutdown: nothing special needed (PyMongo handles cleanup).
+    Startup: pre-warm both sync and async MongoDB clients, ensure indexes,
+    expand threadpool for any remaining sync endpoints.
+    Shutdown: close the async Motor client.
     """
     # Increase the default anyio/starlette threadpool from 40 to 200
     # so that synchronous `def` endpoints can serve 200 concurrent requests
     # per worker process without queuing.
     import anyio
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = 200
-    log.info("Threadpool limiter expanded to %d tokens.", limiter.total_tokens)
+    thread_limiter = anyio.to_thread.current_default_thread_limiter()
+    thread_limiter.total_tokens = 200
+    log.info("Threadpool limiter expanded to %d tokens.", thread_limiter.total_tokens)
 
-    # Pre-warm database and indexes so the first request pays no setup cost
-    from db import ensure_all_indexes
+    # Pre-warm PyMongo connection and ensure indexes (sync)
     ensure_all_indexes()
 
+    # Pre-warm async Motor client so the first async request pays no setup cost
+    async_client = get_async_client()
+    await async_client.admin.command("ping")
+    log.info("Async Motor client pre-warmed and connected.")
+
     yield  # app is running
+
+    async_client.close()
     log.info("Shutting down News Pipeline API.")
 
 
@@ -181,24 +195,42 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+# ---------------------------------------------------------------------------
+# Rate Limiting — protect against single-IP abuse (uses Redis if available)
+# ---------------------------------------------------------------------------
+rate_limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = rate_limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 # ---------------------------------------------------------------------------
 # Background Task Tracking and Locking
 # ---------------------------------------------------------------------------
 _active_fetches = set()
+_fetch_results: Dict[str, Dict[str, Any]] = {}
 _fetch_lock = threading.Lock()
 
 def _run_pipeline_background(company: Optional[str]):
     """Background task function to execute the pipeline fetch and clear cache on success."""
     key = company if company is not None else "__all__"
+    started = time.time()
+    error_msg = None
     try:
         fetch.run_pipeline(return_data=False, query=company)
     except Exception as e:
+        error_msg = str(e)
         log.error(f"Background fetch error for {company or 'all'}: {e}")
     finally:
+        duration = round(time.time() - started, 2)
+        _fetch_results[key] = {
+            "company": company or "all",
+            "duration_seconds": duration,
+            "error": error_msg,
+        }
         with _fetch_lock:
             _active_fetches.discard(key)
         cache.clear()
+        log.info("Pipeline for '%s' finished in %.2fs.", company or "all", duration)
 
 
 def _send_email_background(email: str, limit: int, company: Optional[str]):
@@ -265,28 +297,91 @@ def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, 
     }
 
 
+@app.get("/api/fetch/status")
+def fetch_status(
+    company: str = Query(None, description="Optional company name or ticker to check"),
+) -> Dict[str, Any]:
+    """
+    Check the current status of a fetch pipeline run.
+    Returns 'running', 'completed' (with duration), or 'idle'.
+    """
+    key = company if company is not None else "__all__"
+    with _fetch_lock:
+        is_running = key in _active_fetches
+    if is_running:
+        return {"status": "running", "company": company or "all"}
+    result = _fetch_results.get(key)
+    if result:
+        return {"status": "completed", **result}
+    return {"status": "idle", "company": company or "all"}
+
+
 @app.get("/api/articles")
-def get_articles(
-    response: Response,
+@rate_limiter.limit("60/minute")
+async def get_articles(
+    request: Request,
     company: str = Query(None, description="Optional company name or ticker to filter by"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
-) -> Dict[str, Any]:
+):
     """
     Retrieves already fetched articles directly from the database with pagination.
-    This naturally skips any broken/revoked external APIs.
+
+    This endpoint is **fully async** (Motor) so it never blocks the threadpool,
+    allowing a single Uvicorn worker to handle thousands of concurrent reads.
+    Responses are pre-serialized to bytes and cached, eliminating redundant
+    JSON encoding on cache hits.
     """
-    response.headers["Cache-Control"] = "public, max-age=60, s-maxage=300, stale-while-revalidate=60"
+    headers = {"Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=60"}
     cache_key = f"articles:{company or 'all'}:p{page}:pp{per_page}"
-    cached_val = cache.get(cache_key)
-    if cached_val is not None:
-        return cached_val
+
+    # Fast path: return pre-serialized bytes from cache
+    cached_bytes = cache.get(cache_key)
+    if cached_bytes is not None:
+        return Response(content=cached_bytes, media_type="application/json", headers=headers)
 
     try:
         skip = (page - 1) * per_page
-        articles, total = fetch.get_saved_articles(
-            query=company, limit=per_page, skip=skip
-        )
+        collection = get_async_collection()
+
+        # Lean projection — exclude heavy fields the list view doesn't need
+        projection = {
+            "_id": 0,
+            "content": 0,
+            "url_hash": 0,
+            "created_at": 0,
+            "fetched_at": 0,
+        }
+
+        if company:
+            # Filtered: single round-trip via $facet (text-search + count + page)
+            pipeline = [
+                {"$match": {"$text": {"$search": company}}},
+                {"$sort": {"published_at": -1}},
+                {"$facet": {
+                    "data": [
+                        {"$skip": skip},
+                        {"$limit": per_page},
+                        {"$project": projection},
+                    ],
+                    "total": [{"$count": "count"}],
+                }},
+            ]
+            result = await collection.aggregate(pipeline).to_list(length=1)
+            facet = result[0] if result else {"data": [], "total": []}
+            articles = facet.get("data", [])
+            total = facet["total"][0]["count"] if facet.get("total") else 0
+        else:
+            # Unfiltered: run count (O(1) metadata) and find concurrently
+            total, articles = await asyncio.gather(
+                collection.estimated_document_count(),
+                collection.find({}, projection)
+                    .sort("published_at", -1)
+                    .skip(skip)
+                    .limit(per_page)
+                    .to_list(length=per_page),
+            )
+
         total_pages = max(1, -(-total // per_page))  # ceiling division
         response_data = {
             "status": "success",
@@ -297,10 +392,11 @@ def get_articles(
             "total_pages": total_pages,
             "data": articles,
         }
-        # Cache for 5 minutes — articles don't change frequently;
-        # cache is invalidated automatically when the fetch pipeline completes.
-        cache.set(cache_key, response_data, ttl=300)
-        return response_data
+
+        # Pre-serialize to bytes and cache — avoids redundant JSON encoding on hits
+        response_bytes = _json_dumps(response_data)
+        cache.set(cache_key, response_bytes, ttl=300)
+        return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
         log.error(f"Error fetching saved articles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -406,6 +502,23 @@ def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, backgrou
         "status": "accepted",
         "message": "Newsletter broadcast queued for all active subscribers."
     }
+
+
+# ---------------------------------------------------------------------------
+# Readiness Health Check — reports whether the DB is actually reachable.
+# Orchestrators (Docker, K8s, Render) use this to route traffic only to
+# healthy instances, preventing users from hitting cold/broken pods.
+# ---------------------------------------------------------------------------
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Deep health check: verifies MongoDB connectivity."""
+    try:
+        client = get_async_client()
+        await client.admin.command("ping")
+        return {"status": "ready"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
 
 if __name__ == "__main__":
