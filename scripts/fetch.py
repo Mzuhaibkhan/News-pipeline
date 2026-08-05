@@ -961,6 +961,10 @@ def get_saved_articles(
 
     Returns a tuple of (articles_list, total_matching_count) to support
     pagination in the API layer.
+
+    For filtered ($text) queries a single ``$facet`` aggregation is used
+    so that the count and the data page are fetched in **one** round-trip
+    instead of two, halving connection usage under heavy concurrency.
     """
     collection = get_collection()
 
@@ -979,20 +983,34 @@ def get_saved_articles(
     }
 
     if query:
-        # Use MongoDB text search (backed by text index on title, description, keywords)
-        db_filter = {"$text": {"$search": query}}
-        total = collection.count_documents(db_filter)
+        # --- Single round-trip via $facet (text-search + count + paginate) ---
+        pipeline = [
+            {"$match": {"$text": {"$search": query}}},
+            {"$sort": {"published_at": -1}},
+            {"$facet": {
+                "data": [
+                    {"$skip": skip},
+                    {"$limit": effective_limit},
+                    {"$project": projection},
+                ],
+                "total": [{"$count": "count"}],
+            }},
+        ]
+        result = list(collection.aggregate(pipeline))
+        facet = result[0] if result else {"data": [], "total": []}
+        articles = facet.get("data", [])
+        total = facet["total"][0]["count"] if facet.get("total") else 0
     else:
-        db_filter = {}
+        # Unfiltered — estimated_document_count is O(1) (metadata lookup)
         total = collection.estimated_document_count()
-    cursor = (
-        collection.find(db_filter, projection)
-        .sort([("published_at", -1)])
-        .skip(skip)
-        .limit(effective_limit)
-    )
+        cursor = (
+            collection.find({}, projection)
+            .sort([("published_at", -1)])
+            .skip(skip)
+            .limit(effective_limit)
+        )
+        articles = list(cursor)
 
-    articles = list(cursor)
     return articles, total
 
 
