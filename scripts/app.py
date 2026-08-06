@@ -34,6 +34,8 @@ try:
     def _json_loads(data: bytes) -> Any:
         return orjson.loads(data)
 
+from datetime import datetime, timedelta
+
 except ImportError:
     import json
     from fastapi.responses import JSONResponse as ORJSONResponse
@@ -452,6 +454,72 @@ async def get_all_articles(
         return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
         log.error(f"Error fetching all saved articles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/articles/new")
+@rate_limiter.limit("60/minute")
+async def get_newest_articles(
+    request: Request,
+    company: str = Query(None, description="Optional company name or ticker to filter by"),
+):
+    """
+    Retrieves only the articles fetched during the most recent fetch pipeline run.
+    """
+    headers = {"Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=60"}
+    cache_key = f"articles:{company or 'all'}:new"
+
+    cached_bytes = cache.get(cache_key)
+    if cached_bytes is not None:
+        return Response(content=cached_bytes, media_type="application/json", headers=headers)
+
+    try:
+        collection = get_async_collection()
+
+        # Find the absolute latest fetched_at timestamp in the collection
+        latest_article = await collection.find_one({}, sort=[("fetched_at", -1)])
+        if not latest_article or "fetched_at" not in latest_article:
+            return Response(content=_json_dumps({"status": "success", "count": 0, "data": []}), media_type="application/json")
+
+        latest_time = latest_article["fetched_at"]
+        
+        # A single fetch pipeline run usually takes a few seconds to a minute.
+        # We grab everything fetched within 10 minutes of the absolute latest article
+        # to ensure we capture the entire batch.
+        batch_threshold = latest_time - timedelta(minutes=10)
+
+        projection = {
+            "_id": 0,
+            "content": 0,
+            "url_hash": 0,
+            "created_at": 0,
+            # We keep fetched_at out of the response to match other endpoints, 
+            # though it's used for the query.
+            "fetched_at": 0, 
+        }
+
+        query = {"fetched_at": {"$gte": batch_threshold}}
+
+        if company:
+            pipeline = [
+                {"$match": {"$text": {"$search": company}, "fetched_at": {"$gte": batch_threshold}}},
+                {"$sort": {"published_at": -1}},
+                {"$project": projection},
+            ]
+            articles = await collection.aggregate(pipeline).to_list(length=None)
+        else:
+            articles = await collection.find(query, projection).sort("published_at", -1).to_list(length=None)
+
+        response_data = {
+            "status": "success",
+            "count": len(articles),
+            "data": articles,
+        }
+
+        response_bytes = _json_dumps(response_data)
+        cache.set(cache_key, response_bytes, ttl=300)
+        return Response(content=response_bytes, media_type="application/json", headers=headers)
+    except Exception as e:
+        log.error(f"Error fetching newest articles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def _run_cleanup_background(days_old: int):
