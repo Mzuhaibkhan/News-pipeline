@@ -58,8 +58,8 @@ def get_client() -> MongoClient:
                 serverSelectionTimeoutMS=10_000,
                 tlsCAFile=certifi.where(),
                 # --- Connection pool tuning for high concurrency ---
-                maxPoolSize=200,        # support 200 concurrent DB ops per worker
-                minPoolSize=10,         # keep 10 connections warm to avoid setup overhead
+                maxPoolSize=20,         # support 20 concurrent DB ops per worker
+                minPoolSize=5,          # keep 5 connections warm to avoid setup overhead
                 maxIdleTimeMS=45_000,   # reclaim idle connections after 45s
             )
             client.admin.command("ping")  # fail-fast connectivity check
@@ -171,8 +171,8 @@ def get_async_client() -> AsyncIOMotorClient:
             MONGO_URI,
             serverSelectionTimeoutMS=10_000,
             tlsCAFile=certifi.where(),
-            maxPoolSize=200,
-            minPoolSize=10,
+            maxPoolSize=20,
+            minPoolSize=5,
             maxIdleTimeMS=45_000,
         )
         log.info("Async Motor client initialized (pool=200).")
