@@ -56,10 +56,27 @@ Returns a simple healthcheck status to ensure the service is running.
 
 **Endpoint:** `GET /api/fetch` or `POST /api/fetch`
 
-Triggers the fetch pipeline. It fetches articles from all configured sources, enriches them, upserts them to MongoDB, and returns the fetched articles. 
+Triggers the fetch pipeline in the **background**. It fetches articles from all configured sources, enriches them, upserts them to MongoDB, and returns immediately with a status message to prevent HTTP timeouts. You can check the progress via `/api/fetch/status`.
 
 **Query Parameters:**
-- `company` (Optional string): Filters the returned fetched articles for a specific company name or ticker (e.g., `Apple` or `AAPL`).
+- `company` (Optional string): Filters the fetched articles for a specific company name or ticker (e.g., `Apple` or `AAPL`).
+
+**Example Response:**
+```json
+{
+  "status": "accepted",
+  "message": "Fetch pipeline triggered in background for: all."
+}
+```
+
+### 2b. Check Fetch Status
+
+**Endpoint:** `GET /api/fetch/status`
+
+Checks the current status of the background fetch pipeline.
+
+**Query Parameters:**
+- `company` (Optional string): Filters the status for a specific company.
 
 **Example Response:**
 ```json
@@ -104,13 +121,18 @@ Retrieves already-fetched articles directly from the database without querying e
 
 **Query Parameters:**
 - `company` (Optional string): Filters the returned articles for a specific company name or ticker.
-- `limit` (Optional integer, default: `100`): Maximum number of articles to return.
+- `page` (Optional integer, default: `1`): Page number for pagination.
+- `per_page` (Optional integer, default: `20`, max: `1000`): Number of articles to return per page.
 
 **Example Response:**
 ```json
 {
   "status": "success",
-  "count": 1,
+  "count": 20,
+  "total": 500,
+  "page": 1,
+  "per_page": 20,
+  "total_pages": 25,
   "data": [
     {
        "title": "Saved Article Example",
@@ -119,6 +141,25 @@ Retrieves already-fetched articles directly from the database without querying e
   ]
 }
 ```
+
+### 3b. Get All Articles (Unpaginated)
+
+**Endpoint:** `GET /api/articles/all`
+
+Retrieves **every single article** stored in the database without pagination. 
+*(Note: This endpoint has a stricter rate limit of 10 requests/minute because it can return very large payloads).*
+
+**Query Parameters:**
+- `company` (Optional string): Filters the returned articles for a specific company name or ticker.
+
+### 3c. Get Only the Newest Batch
+
+**Endpoint:** `GET /api/articles/new`
+
+Retrieves only the exact batch of articles that were fetched the **last time** the `/api/fetch` pipeline was triggered. It dynamically calculates the latest timestamp in the database and returns all articles fetched within 10 minutes of it.
+
+**Query Parameters:**
+- `company` (Optional string): Filters the returned articles for a specific company name or ticker.
 
 ### 4. Cleanup Old News
 
