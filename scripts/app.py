@@ -322,7 +322,7 @@ async def get_articles(
     request: Request,
     company: str = Query(None, description="Optional company name or ticker to filter by"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
+    per_page: int = Query(20, ge=1, le=1000, description="Articles per page (max 1000)"),
 ):
     """
     Retrieves already fetched articles directly from the database with pagination.
@@ -399,6 +399,59 @@ async def get_articles(
         return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
         log.error(f"Error fetching saved articles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/articles/all")
+@rate_limiter.limit("10/minute")
+async def get_all_articles(
+    request: Request,
+    company: str = Query(None, description="Optional company name or ticker to filter by"),
+):
+    """
+    Retrieves ALL fetched articles directly from the database without pagination.
+    WARNING: Can return a very large payload.
+    """
+    headers = {"Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=60"}
+    cache_key = f"articles:{company or 'all'}:all"
+
+    # Fast path: return pre-serialized bytes from cache
+    cached_bytes = cache.get(cache_key)
+    if cached_bytes is not None:
+        return Response(content=cached_bytes, media_type="application/json", headers=headers)
+
+    try:
+        collection = get_async_collection()
+
+        # Lean projection
+        projection = {
+            "_id": 0,
+            "content": 0,
+            "url_hash": 0,
+            "created_at": 0,
+            "fetched_at": 0,
+        }
+
+        if company:
+            pipeline = [
+                {"$match": {"$text": {"$search": company}}},
+                {"$sort": {"published_at": -1}},
+                {"$project": projection},
+            ]
+            articles = await collection.aggregate(pipeline).to_list(length=None)
+        else:
+            articles = await collection.find({}, projection).sort("published_at", -1).to_list(length=None)
+
+        response_data = {
+            "status": "success",
+            "count": len(articles),
+            "data": articles,
+        }
+
+        response_bytes = _json_dumps(response_data)
+        cache.set(cache_key, response_bytes, ttl=300)
+        return Response(content=response_bytes, media_type="application/json", headers=headers)
+    except Exception as e:
+        log.error(f"Error fetching all saved articles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def _run_cleanup_background(days_old: int):
