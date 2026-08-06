@@ -19,22 +19,6 @@ This is a FastAPI-based web service that aggregates news from multiple sources (
    uvicorn app:app --host 0.0.0.0 --port 10000 --reload
    ```
 
-## Deployment to Render (with MongoDB Atlas)
-
-Since this app connects to a cloud-based MongoDB Atlas cluster, deploying it to Render is incredibly straightforward. You don't need to host a separate database on Render; the app will just connect to Atlas.
-
-1. **Push your code to GitHub.**
-2. **Log into Render** (https://render.com) and click **New > Web Service**.
-3. Connect your GitHub account and select this `News-pipeline` repository.
-4. **Configuration**:
-   - **Name:** `news-pipeline-api` (or similar)
-   - **Root Directory:** `News-pipeline/scripts` (if your app is inside the scripts folder, otherwise leave blank or match your exact repo structure)
-   - **Environment:** `Python 3`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `uvicorn app:app --host 0.0.0.0 --port 10000`
-5. **Environment Variables**:
-   Add all the keys from your `.env` file under "Environment > Add Environment Variable". Crucially, make sure `MONGO_URI` is set to your MongoDB Atlas connection string.
-6. Click **Create Web Service**. Your API will now be live on Render!
 
 ## Endpoints
 
@@ -161,24 +145,6 @@ Retrieves only the exact batch of articles that were fetched the **last time** t
 **Query Parameters:**
 - `company` (Optional string): Filters the returned articles for a specific company name or ticker.
 
-### 4. Cleanup Old News
-
-**Endpoint:** `POST /api/cleanup`
-
-Triggers a cleanup operation to delete old articles from the MongoDB database.
-
-**Query Parameters:**
-- `days_old` (Optional integer, default: `15`): The number of days old an article must be before it is deleted.
-
-**Example Response:**
-```json
-{
-  "status": "success",
-  "message": "Cleared articles older than 15 days"
-}
-```
-
----
 
 ## 📬 Newsletter & Email Feature
 
