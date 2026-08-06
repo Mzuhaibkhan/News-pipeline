@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 import logging
 import time
 import threading
+from datetime import datetime, timedelta
 
 import os
 import redis
@@ -34,7 +35,6 @@ try:
     def _json_loads(data: bytes) -> Any:
         return orjson.loads(data)
 
-from datetime import datetime, timedelta
 
 except ImportError:
     import json
