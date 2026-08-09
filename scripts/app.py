@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import asyncio
-from fastapi import FastAPI, BackgroundTasks, Query, HTTPException, Response, Request
+from fastapi import FastAPI, BackgroundTasks, Depends, Header, Query, HTTPException, Response, Request
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
@@ -206,6 +206,30 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------------------------------------------------------------------------
+# API Key Authentication — protects admin/destructive endpoints
+# ---------------------------------------------------------------------------
+
+_API_SECRET_KEY = os.getenv("API_SECRET_KEY", "")
+
+if not _API_SECRET_KEY:
+    log.warning("API_SECRET_KEY not set — admin endpoints are UNPROTECTED (dev mode).")
+
+
+async def verify_api_key(x_api_key: str = Header(None)):
+    """Validate the X-API-Key header against the API_SECRET_KEY env var.
+
+    If API_SECRET_KEY is not configured, all requests are allowed (dev mode).
+    """
+    if not _API_SECRET_KEY:
+        return  # No key configured — allow through (development mode)
+    if x_api_key != _API_SECRET_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key. Provide a valid X-API-Key header.",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Background Task Tracking and Locking
 # ---------------------------------------------------------------------------
 _active_fetches = set()
@@ -277,7 +301,7 @@ def read_root() -> Dict[str, str]:
 
 @app.post("/api/fetch")
 @app.get("/api/fetch")
-def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, description="Optional company name or ticker to search for")) -> Dict[str, Any]:
+def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, description="Optional company name or ticker to search for"), _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Triggers the fetch pipeline in the background and returns immediately.
     If 'company' is provided, it specifically fetches articles related to that company.
@@ -537,6 +561,7 @@ def _run_cleanup_background(days_old: int):
 def trigger_cleanup(
     background_tasks: BackgroundTasks,
     days_old: int = Query(15, description="Number of days old before deleting"),
+    _api_key: str = Depends(verify_api_key),
 ) -> Dict[str, str]:
     """
     Triggers cleanup of old articles from MongoDB in the background.
@@ -553,7 +578,7 @@ def trigger_cleanup(
 # ---------------------------------------------------------------------------
 
 @app.post("/api/newsletter/send", status_code=202)
-def send_newsletter_to_email(req: SendEmailRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+def send_newsletter_to_email(req: SendEmailRequest, background_tasks: BackgroundTasks, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Queues today's news digest to be emailed to the specified user address.
     Returns immediately with 202 Accepted — the email is sent in the background.
@@ -594,7 +619,7 @@ def unsubscribe(req: SubscriberRequest) -> Dict[str, Any]:
 
 
 @app.get("/api/newsletter/subscribers")
-def list_subscribers() -> Dict[str, Any]:
+def list_subscribers(_api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Retrieves list of active subscriber emails.
     """
@@ -611,7 +636,7 @@ def list_subscribers() -> Dict[str, Any]:
 
 
 @app.post("/api/newsletter/broadcast", status_code=202)
-def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, background_tasks: BackgroundTasks = None) -> Dict[str, Any]:
+def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, background_tasks: BackgroundTasks = None, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Broadcasts today's news digest to all active subscribers in the background.
     Returns immediately with 202 Accepted.
