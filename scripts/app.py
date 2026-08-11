@@ -197,10 +197,24 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+def get_real_ip(request: Request) -> str:
+    """
+    Extract real client IP address, supporting Cloudflare (CF-Connecting-IP)
+    and standard reverse proxies (X-Forwarded-For).
+    """
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 # ---------------------------------------------------------------------------
 # Rate Limiting — protect against single-IP abuse (uses Redis if available)
 # ---------------------------------------------------------------------------
-rate_limiter = Limiter(key_func=get_remote_address)
+rate_limiter = Limiter(key_func=get_real_ip)
 app.state.limiter = rate_limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -348,7 +362,7 @@ async def get_articles(
     request: Request,
     company: str = Query(None, description="Optional company name or ticker to filter by"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(20, ge=1, le=1000, description="Articles per page (max 1000)"),
+    per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
 ):
     """
     Retrieves already fetched articles directly from the database with pagination.
@@ -432,6 +446,7 @@ async def get_articles(
 async def get_all_articles(
     request: Request,
     company: str = Query(None, description="Optional company name or ticker to filter by"),
+    _api_key: str = Depends(verify_api_key),
 ):
     """
     Retrieves ALL fetched articles directly from the database without pagination.
