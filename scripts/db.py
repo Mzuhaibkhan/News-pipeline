@@ -57,13 +57,13 @@ def get_client() -> MongoClient:
                 MONGO_URI,
                 serverSelectionTimeoutMS=10_000,
                 tlsCAFile=certifi.where(),
-                # --- Connection pool tuning for high concurrency ---
-                maxPoolSize=20,         # support 20 concurrent DB ops per worker
-                minPoolSize=5,          # keep 5 connections warm to avoid setup overhead
-                maxIdleTimeMS=45_000,   # reclaim idle connections after 45s
+                # --- Connection pool tuning for low idle bandwidth ---
+                maxPoolSize=10,         # support 10 concurrent DB ops per worker
+                minPoolSize=0,          # drop idle connections when inactive to save bandwidth
+                maxIdleTimeMS=15_000,   # reclaim idle connections after 15s
             )
             client.admin.command("ping")  # fail-fast connectivity check
-            log.info("Connected to MongoDB cluster (singleton client, pool=200).")
+            log.info("Connected to MongoDB cluster (singleton client).")
         except ConnectionFailure as exc:
             log.critical("MongoDB connection failed: %s", exc)
             raise RuntimeError(f"MongoDB connection failed: {exc}")
@@ -171,11 +171,11 @@ def get_async_client() -> AsyncIOMotorClient:
             MONGO_URI,
             serverSelectionTimeoutMS=10_000,
             tlsCAFile=certifi.where(),
-            maxPoolSize=20,
-            minPoolSize=5,
-            maxIdleTimeMS=45_000,
+            maxPoolSize=10,
+            minPoolSize=0,
+            maxIdleTimeMS=15_000,
         )
-        log.info("Async Motor client initialized (pool=200).")
+        log.info("Async Motor client initialized.")
         return _async_client
 
 
