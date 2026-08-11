@@ -13,6 +13,5 @@ COPY *.py .
 # WEB_CONCURRENCY: number of worker processes (default: 4, adjust to match CPU cores).
 # -k uvicorn.workers.UvicornWorker: each worker runs an async event loop.
 # --timeout 120: allow long-running requests (e.g. fetches) up to 2 minutes.
-# WEB_CONCURRENCY: default bumped to 8 (8×200 = 1,600 thread capacity for sync paths).
-# With async Motor endpoints the event-loop handles concurrency, so even fewer workers suffice.
-CMD ["sh", "-c", "gunicorn app:app -w ${WEB_CONCURRENCY:-8} -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000 --timeout 120"]
+# WEB_CONCURRENCY: default set to 2 workers to optimize RAM and idle database bandwidth on Render.
+CMD ["sh", "-c", "gunicorn app:app -w ${WEB_CONCURRENCY:-2} -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000 --timeout 120"]
