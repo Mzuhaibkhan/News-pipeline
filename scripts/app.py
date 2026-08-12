@@ -1,6 +1,9 @@
 from contextlib import asynccontextmanager
 import asyncio
+import hmac
+import uuid
 from fastapi import FastAPI, BackgroundTasks, Depends, Header, Query, HTTPException, Response, Request
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, List, Optional
@@ -136,6 +139,11 @@ class RedisCache:
 def _init_cache():
     redis_url = os.getenv("REDIS_URL")
     if redis_url:
+        if not redis_url.startswith("rediss://"):
+            log.warning(
+                "REDIS_URL does not use TLS (rediss://). "
+                "This is insecure for production deployments."
+            )
         try:
             log.info("Attempting to connect to Redis cache at %s...", redis_url)
             redis_cache = RedisCache(redis_url)
@@ -197,6 +205,50 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+# ---------------------------------------------------------------------------
+# CORS — restrict cross-origin access to explicitly allowed frontend domains.
+# Set CORS_ALLOWED_ORIGINS in .env as a comma-separated list of origins.
+# ---------------------------------------------------------------------------
+_cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+_cors_origins = [o.strip() for o in _cors_origins if o.strip()]
+
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-Api-Key", "Content-Type"],
+        allow_credentials=False,
+    )
+    log.info("CORS middleware enabled for origins: %s", _cors_origins)
+
+
+# ---------------------------------------------------------------------------
+# Security Headers — industry-standard response hardening
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers.pop("server", None)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Request ID Tracing — correlate logs across services during incidents
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 def get_real_ip(request: Request) -> str:
     """
     Extract real client IP address, supporting Cloudflare (CF-Connecting-IP)
@@ -233,10 +285,17 @@ async def verify_api_key(x_api_key: str = Header(None)):
     """Validate the X-API-Key header against the API_SECRET_KEY env var.
 
     If API_SECRET_KEY is not configured, all requests are allowed (dev mode).
+
+    Uses hmac.compare_digest() for constant-time comparison to prevent
+    timing attacks that could brute-force the key one character at a time.
+
+    Future evolution path:
+    - Soon: Multiple named API keys stored in DB with scopes
+    - Later: JWT/OAuth2 with expiry, refresh tokens, and role-based access
     """
     if not _API_SECRET_KEY:
         return  # No key configured — allow through (development mode)
-    if x_api_key != _API_SECRET_KEY:
+    if x_api_key is None or not hmac.compare_digest(x_api_key, _API_SECRET_KEY):
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing API key. Provide a valid X-API-Key header.",
@@ -315,7 +374,7 @@ def read_root() -> Dict[str, str]:
 
 @app.post("/api/fetch")
 @app.get("/api/fetch")
-def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, description="Optional company name or ticker to search for"), _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
+def trigger_fetch(background_tasks: BackgroundTasks, company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"), _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Triggers the fetch pipeline in the background and returns immediately.
     If 'company' is provided, it specifically fetches articles related to that company.
@@ -339,7 +398,7 @@ def trigger_fetch(background_tasks: BackgroundTasks, company: str = Query(None, 
 
 @app.get("/api/fetch/status")
 def fetch_status(
-    company: str = Query(None, description="Optional company name or ticker to check"),
+    company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
 ) -> Dict[str, Any]:
     """
     Check the current status of a fetch pipeline run.
@@ -360,7 +419,7 @@ def fetch_status(
 @rate_limiter.limit("60/minute")
 async def get_articles(
     request: Request,
-    company: str = Query(None, description="Optional company name or ticker to filter by"),
+    company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(20, ge=1, le=100, description="Articles per page (max 100)"),
 ):
@@ -438,14 +497,14 @@ async def get_articles(
         cache.set(cache_key, response_bytes, ttl=300)
         return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
-        log.error(f"Error fetching saved articles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error fetching saved articles: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 @app.get("/api/articles/all")
 @rate_limiter.limit("10/minute")
 async def get_all_articles(
     request: Request,
-    company: str = Query(None, description="Optional company name or ticker to filter by"),
+    company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
     _api_key: str = Depends(verify_api_key),
 ):
     """
@@ -492,14 +551,14 @@ async def get_all_articles(
         cache.set(cache_key, response_bytes, ttl=300)
         return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
-        log.error(f"Error fetching all saved articles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error fetching all saved articles: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 @app.get("/api/articles/new")
 @rate_limiter.limit("60/minute")
 async def get_newest_articles(
     request: Request,
-    company: str = Query(None, description="Optional company name or ticker to filter by"),
+    company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
 ):
     """
     Retrieves only the articles fetched during the most recent fetch pipeline run.
@@ -558,8 +617,8 @@ async def get_newest_articles(
         cache.set(cache_key, response_bytes, ttl=300)
         return Response(content=response_bytes, media_type="application/json", headers=headers)
     except Exception as e:
-        log.error(f"Error fetching newest articles: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error fetching newest articles: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 def _run_cleanup_background(days_old: int):
     """Background task function for article cleanup."""
@@ -606,7 +665,8 @@ def send_newsletter_to_email(req: SendEmailRequest, background_tasks: Background
 
 
 @app.post("/api/newsletter/subscribe")
-def subscribe(req: SubscriberRequest) -> Dict[str, Any]:
+@rate_limiter.limit("5/minute")
+def subscribe(request: Request, req: SubscriberRequest) -> Dict[str, Any]:
     """
     Subscribes a user email address to receive daily news updates.
     """
@@ -616,12 +676,13 @@ def subscribe(req: SubscriberRequest) -> Dict[str, Any]:
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        log.error(f"Error subscribing email {req.email}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error subscribing email %s: %s", req.email, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 
 @app.post("/api/newsletter/unsubscribe")
-def unsubscribe(req: SubscriberRequest) -> Dict[str, Any]:
+@rate_limiter.limit("5/minute")
+def unsubscribe(request: Request, req: SubscriberRequest) -> Dict[str, Any]:
     """
     Unsubscribes a user email address from daily news updates.
     """
@@ -629,8 +690,8 @@ def unsubscribe(req: SubscriberRequest) -> Dict[str, Any]:
         result = newsletter.unsubscribe_email(req.email)
         return result
     except Exception as e:
-        log.error(f"Error unsubscribing email {req.email}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error unsubscribing email %s: %s", req.email, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 
 @app.get("/api/newsletter/subscribers")
@@ -646,8 +707,8 @@ def list_subscribers(_api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
             "subscribers": subscribers
         }
     except Exception as e:
-        log.error(f"Error listing subscribers: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error("Error listing subscribers: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 
 @app.post("/api/newsletter/broadcast", status_code=202)
@@ -673,7 +734,13 @@ def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, backgrou
 
 @app.get("/health/ready")
 async def readiness_check():
-    """Deep health check: verifies MongoDB connectivity."""
+    """Deep health check: verifies MongoDB connectivity.
+
+    NOTE: Intentionally unauthenticated — this endpoint is consumed by
+    orchestrator probes (Docker, K8s, Render) and must remain publicly
+    accessible. It only returns {"status": "ready"} or HTTP 503,
+    exposing no sensitive data.
+    """
     try:
         client = get_async_client()
         await client.admin.command("ping")
