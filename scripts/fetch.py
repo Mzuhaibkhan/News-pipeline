@@ -503,15 +503,16 @@ def fetch_rss(query: str | None = None) -> Generator[dict[str, Any], None, None]
 
 def fetch_tiingo(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not TIINGO_KEY: return
-    url = "https://api.tiingo.com/tiingo/news?limit=10"
+    base_url = "https://api.tiingo.com/tiingo/news"
+    params: dict[str, Any] = {"limit": 10}
     if query:
-        url += f"&tickers={query}"
+        params["tickers"] = query
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Token {TIINGO_KEY}"
     }
     try:
-        response = http_session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         for item in data:
@@ -535,11 +536,12 @@ def fetch_tiingo(query: str | None = None) -> Generator[dict[str, Any], None, No
 
 def fetch_marketaux(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not MARKETAUX_KEY: return
-    url = f"https://api.marketaux.com/v1/news/all?api_token={MARKETAUX_KEY}&language=en&limit=10"
+    base_url = "https://api.marketaux.com/v1/news/all"
+    params: dict[str, Any] = {"api_token": MARKETAUX_KEY, "language": "en", "limit": 10}
     if query:
-        url += f"&search={query}"
+        params["search"] = query
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("data", [])
         for item in data:
@@ -563,11 +565,13 @@ def fetch_marketaux(query: str | None = None) -> Generator[dict[str, Any], None,
 def fetch_stock_news_api(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not STOCK_NEWS_KEY: return
     if query:
-        url = f"https://stocknewsapi.com/api/v1?tickers={query}&items=10&token={STOCK_NEWS_KEY}"
+        base_url = "https://stocknewsapi.com/api/v1"
+        params: dict[str, Any] = {"tickers": query, "items": 10, "token": STOCK_NEWS_KEY}
     else:
-        url = f"https://stocknewsapi.com/api/v1/category?section=general&items=10&token={STOCK_NEWS_KEY}"
+        base_url = "https://stocknewsapi.com/api/v1/category"
+        params = {"section": "general", "items": 10, "token": STOCK_NEWS_KEY}
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("data", [])
         for item in data:
@@ -590,11 +594,12 @@ def fetch_stock_news_api(query: str | None = None) -> Generator[dict[str, Any], 
 
 def fetch_apitube(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not APITUBE_KEY: return
-    url = f"https://api.apitube.io/v1/news/everything?api_key={APITUBE_KEY}&limit=10"
+    base_url = "https://api.apitube.io/v1/news/everything"
+    params: dict[str, Any] = {"api_key": APITUBE_KEY, "limit": 10}
     if query:
-        url += f"&q={query}"
+        params["q"] = query
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("results", [])
         for item in data:
@@ -618,9 +623,10 @@ def fetch_apitube(query: str | None = None) -> Generator[dict[str, Any], None, N
 def fetch_gnews(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not GNEWS_KEY: return
     search_q = query if query else "stocks"
-    url = f"https://gnews.io/api/v4/search?q={search_q}&lang=en&max=10&apikey={GNEWS_KEY}"
+    base_url = "https://gnews.io/api/v4/search"
+    params: dict[str, Any] = {"q": search_q, "lang": "en", "max": 10, "apikey": GNEWS_KEY}
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json().get("articles", [])
         for item in data:
@@ -643,9 +649,10 @@ def fetch_gnews(query: str | None = None) -> Generator[dict[str, Any], None, Non
 
 def fetch_finnhub(query: str | None = None) -> Generator[dict[str, Any], None, None]:
     if not FINNHUB_KEY: return
-    url = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
+    base_url = "https://finnhub.io/api/v1/news"
+    params: dict[str, Any] = {"category": "general", "token": FINNHUB_KEY}
     try:
-        response = http_session.get(url, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, headers=CUSTOM_HEADERS, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         for item in data[:10]:
@@ -763,11 +770,12 @@ def fetch_newsdata(query: str | None = None) -> Generator[dict[str, Any], None, 
     """Yield business articles filtered for India from NewsData.io."""
     if not NEWSDATA_KEY:
         return
-    url = f"https://newsdata.io/api/1/news?apikey={NEWSDATA_KEY}&country=in&category=business"
+    base_url = "https://newsdata.io/api/1/news"
+    params: dict[str, Any] = {"apikey": NEWSDATA_KEY, "country": "in", "category": "business"}
     if query:
-        url += f"&q={query}"
+        params["q"] = query
     try:
-        response = http_session.get(url, timeout=REQUEST_TIMEOUT)
+        response = http_session.get(base_url, params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         
