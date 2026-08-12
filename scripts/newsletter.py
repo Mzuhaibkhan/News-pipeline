@@ -11,6 +11,7 @@ Handles:
 from __future__ import annotations
 
 import argparse
+import html as html_mod
 import logging
 import os
 import smtplib
@@ -177,11 +178,11 @@ def render_html_newsletter(articles: List[Dict[str, Any]], recipient_email: Opti
     
     articles_html = ""
     for idx, item in enumerate(articles, 1):
-        title = item.get("title") or "Untitled Article"
-        url = item.get("url") or "#"
-        source = item.get("source") or "News Pipeline"
-        category = (item.get("category") or "General").capitalize()
-        description = item.get("description") or "No description available."
+        title = html_mod.escape(item.get("title") or "Untitled Article")
+        url = html_mod.escape(item.get("url") or "#")
+        source = html_mod.escape(item.get("source") or "News Pipeline")
+        category = html_mod.escape((item.get("category") or "General").capitalize())
+        description = html_mod.escape(item.get("description") or "No description available.")
         published_at = item.get("published_at") or ""
         image_url = item.get("image_url")
         keywords = item.get("keywords") or []
@@ -200,7 +201,7 @@ def render_html_newsletter(articles: List[Dict[str, Any]], recipient_email: Opti
         kw_html = ""
         if keywords:
             tags = "".join(
-                f'<span style="display: inline-block; background-color: #eff6ff; color: #1e40af; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 4px; margin-right: 4px; margin-bottom: 4px;">#{kw}</span>'
+                f'<span style="display: inline-block; background-color: #eff6ff; color: #1e40af; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 4px; margin-right: 4px; margin-bottom: 4px;">#{html_mod.escape(kw)}</span>'
                 for kw in keywords[:4]
             )
             kw_html = f'<div style="margin-top: 10px;">{tags}</div>'
