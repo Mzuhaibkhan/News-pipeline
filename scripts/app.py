@@ -24,6 +24,28 @@ import clear_old_news
 import newsletter
 from db import get_async_client, get_async_collection, ensure_all_indexes
 
+# SSE streaming support (optional — graceful degradation if not installed)
+try:
+    from sse_starlette.sse import EventSourceResponse
+    _SSE_AVAILABLE = True
+except ImportError:
+    _SSE_AVAILABLE = False
+
+# Prometheus metrics (optional — graceful degradation if not installed)
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator as PrometheusInstrumentator
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+
+# Signed unsubscribe token validation
+try:
+    from tokens import validate_unsubscribe_token
+    _TOKENS_AVAILABLE = True
+except ImportError:
+    validate_unsubscribe_token = None
+    _TOKENS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Use orjson for fast JSON serialization (5-10x faster, handles datetime)
 # Falls back to stdlib json if orjson is not installed.
@@ -204,6 +226,15 @@ app = FastAPI(
 # Middleware — GZip compress responses > 500 bytes (70-85% size reduction)
 # ---------------------------------------------------------------------------
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# ---------------------------------------------------------------------------
+# Prometheus Metrics — exposes /metrics endpoint for monitoring systems
+# Tracks request latency, counts, in-progress gauges per endpoint.
+# Install: pip install prometheus-fastapi-instrumentator
+# ---------------------------------------------------------------------------
+if _PROMETHEUS_AVAILABLE:
+    PrometheusInstrumentator().instrument(app).expose(app, endpoint="/metrics")
+    log.info("Prometheus metrics enabled at /metrics")
 
 # ---------------------------------------------------------------------------
 # CORS — restrict cross-origin access to explicitly allowed frontend domains.
@@ -724,6 +755,108 @@ def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, backgrou
         "status": "accepted",
         "message": "Newsletter broadcast queued for all active subscribers."
     }
+
+
+# ---------------------------------------------------------------------------
+# Token-Based 1-Click Unsubscribe (GET with signed HMAC token)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/newsletter/unsubscribe")
+@rate_limiter.limit("10/minute")
+def unsubscribe_via_token(
+    request: Request,
+    token: str = Query(..., description="Signed HMAC unsubscribe token from email"),
+) -> Dict[str, Any]:
+    """1-click unsubscribe endpoint triggered from email footer links.
+
+    Validates the cryptographically signed token to extract the email
+    address, then performs unsubscription. Invalid or expired tokens
+    are rejected with HTTP 400.
+    """
+    if not _TOKENS_AVAILABLE or validate_unsubscribe_token is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Token-based unsubscribe is not configured.",
+        )
+
+    email = validate_unsubscribe_token(token)
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired unsubscribe token.",
+        )
+
+    try:
+        result = newsletter.unsubscribe_email(email)
+        return {
+            "status": "success",
+            "email": email,
+            "message": f"Successfully unsubscribed {email} from newsletter.",
+        }
+    except Exception as e:
+        log.error("Error during token unsubscribe for %s: %s", email, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred.")
+
+
+# ---------------------------------------------------------------------------
+# Real-Time News Streaming via Server-Sent Events (SSE)
+# ---------------------------------------------------------------------------
+
+# In-memory event bus for SSE subscribers (lightweight pub/sub)
+_sse_subscribers: list[asyncio.Queue] = []
+_sse_lock = threading.Lock()
+
+
+def publish_sse_event(event_data: Dict[str, Any]) -> None:
+    """Push a news event to all connected SSE clients.
+
+    Called from background pipeline tasks when new articles are ingested.
+    Thread-safe: acquires lock before iterating subscriber queues.
+    """
+    with _sse_lock:
+        for queue in _sse_subscribers:
+            try:
+                queue.put_nowait(event_data)
+            except asyncio.QueueFull:
+                pass  # Drop events for slow consumers
+
+
+if _SSE_AVAILABLE:
+    @app.get("/api/stream/news")
+    async def stream_news(request: Request):
+        """Real-time Server-Sent Events (SSE) stream of incoming news articles.
+
+        Connect with: `curl -N http://localhost:10000/api/stream/news`
+        or use EventSource in JavaScript.
+
+        Events are pushed when the fetch pipeline ingests new articles.
+        The stream stays open until the client disconnects.
+        """
+        queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+        with _sse_lock:
+            _sse_subscribers.append(queue)
+
+        async def event_generator():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                        yield {
+                            "event": "article",
+                            "data": _json_dumps(data).decode("utf-8"),
+                        }
+                    except asyncio.TimeoutError:
+                        # Send keepalive comment to prevent proxy/CDN timeout
+                        yield {"comment": "keepalive"}
+            finally:
+                with _sse_lock:
+                    if queue in _sse_subscribers:
+                        _sse_subscribers.remove(queue)
+
+        return EventSourceResponse(event_generator())
 
 
 # ---------------------------------------------------------------------------
