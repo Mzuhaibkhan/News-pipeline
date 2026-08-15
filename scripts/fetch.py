@@ -46,6 +46,8 @@ from rake_nltk import Rake
 from textblob import TextBlob
 
 from db import get_collection
+from deduplication import content_hash, deduplicate_batch
+from entities import extract_entities
 
 # ---------------------------------------------------------------------------
 # Retry Session Factory
@@ -170,15 +172,29 @@ def _detect_language(text: str) -> str:
         return "unknown"
 
 
-def _sentiment(text: str) -> dict[str, float]:
-    """Return polarity [-1, 1] and subjectivity [0, 1] via TextBlob."""
+def _sentiment(text: str) -> dict[str, Any]:
+    """Return polarity [-1, 1], subjectivity [0, 1], and a human-readable
+    sentiment label (positive/negative/neutral) via TextBlob with a
+    financial-domain threshold adjustment.
+
+    Financial headlines tend to have lower absolute polarity than general
+    text, so thresholds are set at ±0.05 (vs. the typical ±0.1).
+    """
     if not text.strip():
-        return {"polarity": 0.0, "subjectivity": 0.0}
+        return {"polarity": 0.0, "subjectivity": 0.0, "label": "neutral"}
     blob = TextBlob(text[:2000])
-    return {
-        "polarity": round(blob.sentiment.polarity, 4),
-        "subjectivity": round(blob.sentiment.subjectivity, 4),
-    }
+    polarity = round(blob.sentiment.polarity, 4)
+    subjectivity = round(blob.sentiment.subjectivity, 4)
+
+    # Financial-domain threshold: tighter than general NLP
+    if polarity > 0.05:
+        label = "positive"
+    elif polarity < -0.05:
+        label = "negative"
+    else:
+        label = "neutral"
+
+    return {"polarity": polarity, "subjectivity": subjectivity, "label": label}
 
 
 def _keywords(text: str, max_keywords: int = 10, rake: Rake | None = None) -> list[str]:
@@ -197,7 +213,16 @@ def _url_hash(url: str) -> str:
 
 
 def enrich(article: dict[str, Any], rake: Rake | None = None) -> dict[str, Any]:
-    """Add language, sentiment, and keywords to an article dict in-place."""
+    """Add language, sentiment, keywords, entities, and content hash
+    to an article dict in-place.
+
+    Enrichment pipeline:
+    1. Language detection (langdetect)
+    2. Financial sentiment analysis (TextBlob + domain thresholds)
+    3. Keyword extraction (RAKE-NLTK)
+    4. Named entity extraction (tickers, organizations, events, sectors)
+    5. Content fingerprint (SimHash for cross-source deduplication)
+    """
     combined_text = " ".join(filter(None, [
         article.get("title", ""),
         article.get("description", ""),
@@ -206,6 +231,8 @@ def enrich(article: dict[str, Any], rake: Rake | None = None) -> dict[str, Any]:
     article["language"] = _detect_language(combined_text)
     article["sentiment"] = _sentiment(combined_text)
     article["keywords"] = _keywords(combined_text, rake=rake)
+    article["entities"] = extract_entities(combined_text)
+    article["content_hash"] = content_hash(combined_text)
     return article
 
 
@@ -922,6 +949,16 @@ def run_pipeline(return_data: bool = False, query: str | None = None) -> list[di
                 log.error("Source %s raised: %s", source_name, exc)
 
     log.info("Total raw articles from all sources: %d", len(all_raw_articles))
+
+    # --- Content deduplication: remove syndicated wire duplicates ---
+    pre_dedup_count = len(all_raw_articles)
+    all_raw_articles = deduplicate_batch(all_raw_articles, threshold=3)
+    dedup_removed = pre_dedup_count - len(all_raw_articles)
+    if dedup_removed > 0:
+        log.info(
+            "Content deduplication removed %d syndicated duplicates (kept %d unique).",
+            dedup_removed, len(all_raw_articles),
+        )
 
     # --- Parallel enrichment: NLP ops run across multiple threads ---
     def _enrich_single(article):
