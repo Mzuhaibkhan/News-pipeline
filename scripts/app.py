@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import hmac
 import uuid
-from fastapi import FastAPI, BackgroundTasks, Depends, Header, Query, HTTPException, Response, Request
+from fastapi import FastAPI, Depends, Header, Query, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr
@@ -19,10 +19,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-import fetch
-import clear_old_news
 import newsletter
 from db import get_async_client, get_async_collection, ensure_all_indexes
+
+from arq import create_pool
+from arq.connections import RedisSettings
+from arq.jobs import Job, JobStatus
 
 # SSE streaming support (optional — graceful degradation if not installed)
 try:
@@ -208,8 +210,15 @@ async def lifespan(app):
     await async_client.admin.command("ping")
     log.info("Async Motor client pre-warmed and connected.")
 
+    # Initialize ARQ Redis pool for background tasks
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    app.state.redis_queue = await create_pool(RedisSettings.from_dsn(redis_url))
+    log.info("ARQ Redis pool initialized.")
+
     yield  # app is running
 
+    app.state.redis_queue.close()
+    await app.state.redis_queue.wait_closed()
     async_client.close()
     log.info("Shutting down News Pipeline API.")
 
@@ -334,55 +343,8 @@ async def verify_api_key(x_api_key: str = Header(None)):
 
 
 # ---------------------------------------------------------------------------
-# Background Task Tracking and Locking
-# ---------------------------------------------------------------------------
-_active_fetches = set()
-_fetch_results: Dict[str, Dict[str, Any]] = {}
-_fetch_lock = threading.Lock()
-
-def _run_pipeline_background(company: Optional[str]):
-    """Background task function to execute the pipeline fetch and clear cache on success."""
-    key = company if company is not None else "__all__"
-    started = time.time()
-    error_msg = None
-    try:
-        fetch.run_pipeline(return_data=False, query=company)
-    except Exception as e:
-        error_msg = str(e)
-        log.error(f"Background fetch error for {company or 'all'}: {e}")
-    finally:
-        duration = round(time.time() - started, 2)
-        _fetch_results[key] = {
-            "company": company or "all",
-            "duration_seconds": duration,
-            "error": error_msg,
-        }
-        with _fetch_lock:
-            _active_fetches.discard(key)
-        cache.clear()
-        log.info("Pipeline for '%s' finished in %.2fs.", company or "all", duration)
-
-
-def _send_email_background(email: str, limit: int, company: Optional[str]):
-    """Background task function to send a newsletter email without blocking the request."""
-    try:
-        newsletter.send_todays_news_email(to_email=email, limit=limit, company=company)
-        log.info("Background email sent successfully to %s.", email)
-    except Exception as e:
-        log.error("Background email to %s failed: %s", email, e)
-
-
-def _broadcast_background(limit: int, company: Optional[str]):
-    """Background task function to broadcast newsletter to all subscribers."""
-    try:
-        result = newsletter.broadcast_newsletter(limit=limit, company=company)
-        log.info("Background broadcast complete: sent=%s, failed=%s",
-                 result.get("sent_count"), result.get("failed_count"))
-    except Exception as e:
-        log.error("Background broadcast failed: %s", e)
-
-
 # Pydantic Schemas for Requests
+# ---------------------------------------------------------------------------
 class SendEmailRequest(BaseModel):
     email: EmailStr
     limit: Optional[int] = 10
@@ -405,44 +367,52 @@ def read_root() -> Dict[str, str]:
 
 @app.post("/api/fetch")
 @app.get("/api/fetch")
-def trigger_fetch(background_tasks: BackgroundTasks, company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"), _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
+async def trigger_fetch(company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"), _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
-    Triggers the fetch pipeline in the background and returns immediately.
+    Triggers the fetch pipeline in the background using the ARQ distributed task queue.
     If 'company' is provided, it specifically fetches articles related to that company.
     """
     key = company if company is not None else "__all__"
+    job_id = f"fetch_{key}"
     
-    with _fetch_lock:
-        if key in _active_fetches:
-            return {
-                "status": "accepted",
-                "message": f"Fetch pipeline is already running for: {company or 'all'}. Please wait."
-            }
-        _active_fetches.add(key)
+    # Enqueue job with a specific ID to prevent duplicates
+    job = await app.state.redis_queue.enqueue_job("run_pipeline_task", company, _job_id=job_id)
+    
+    if job is None:
+        return {
+            "status": "accepted",
+            "message": f"Fetch pipeline is already queued or running for: {company or 'all'}. Please wait."
+        }
         
-    background_tasks.add_task(_run_pipeline_background, company)
     return {
         "status": "accepted",
-        "message": f"Fetch pipeline triggered in background for: {company or 'all'}."
+        "message": f"Fetch pipeline triggered in background for: {company or 'all'}.",
+        "job_id": job_id
     }
 
 
 @app.get("/api/fetch/status")
-def fetch_status(
+async def fetch_status(
     company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
 ) -> Dict[str, Any]:
     """
-    Check the current status of a fetch pipeline run.
-    Returns 'running', 'completed' (with duration), or 'idle'.
+    Check the current status of a fetch pipeline run via the ARQ Redis queue.
+    Returns 'running', 'completed', or 'idle'.
     """
     key = company if company is not None else "__all__"
-    with _fetch_lock:
-        is_running = key in _active_fetches
-    if is_running:
+    job_id = f"fetch_{key}"
+    
+    job = Job(job_id, redis=app.state.redis_queue)
+    status = await job.status()
+    
+    if status in (JobStatus.in_progress, JobStatus.queued, JobStatus.deferred):
         return {"status": "running", "company": company or "all"}
-    result = _fetch_results.get(key)
-    if result:
-        return {"status": "completed", **result}
+        
+    if status == JobStatus.complete:
+        info = await job.info()
+        result = info.result if info else None
+        return {"status": "completed", "company": company or "all", "result": result}
+        
     return {"status": "idle", "company": company or "all"}
 
 
@@ -651,28 +621,16 @@ async def get_newest_articles(
         log.error("Error fetching newest articles: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred.")
 
-def _run_cleanup_background(days_old: int):
-    """Background task function for article cleanup."""
-    try:
-        clear_old_news.run_cleanup(days_old=days_old)
-        log.info("Background cleanup completed for articles older than %d days.", days_old)
-    except Exception as e:
-        log.error("Background cleanup error: %s", e)
-    finally:
-        cache.clear()
-
-
 @app.post("/api/cleanup", status_code=202)
-def trigger_cleanup(
-    background_tasks: BackgroundTasks,
+async def trigger_cleanup(
     days_old: int = Query(15, description="Number of days old before deleting"),
     _api_key: str = Depends(verify_api_key),
 ) -> Dict[str, str]:
     """
-    Triggers cleanup of old articles from MongoDB in the background.
+    Triggers cleanup of old articles from MongoDB in the background using ARQ.
     Returns immediately with 202 Accepted.
     """
-    background_tasks.add_task(_run_cleanup_background, days_old)
+    await app.state.redis_queue.enqueue_job("cleanup_task", days_old)
     return {
         "status": "accepted",
         "message": f"Cleanup triggered in background for articles older than {days_old} days.",
@@ -683,12 +641,12 @@ def trigger_cleanup(
 # ---------------------------------------------------------------------------
 
 @app.post("/api/newsletter/send", status_code=202)
-def send_newsletter_to_email(req: SendEmailRequest, background_tasks: BackgroundTasks, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
+async def send_newsletter_to_email(req: SendEmailRequest, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
     Queues today's news digest to be emailed to the specified user address.
-    Returns immediately with 202 Accepted — the email is sent in the background.
+    Returns immediately with 202 Accepted — the email is sent in the background via ARQ.
     """
-    background_tasks.add_task(_send_email_background, req.email, req.limit or 10, req.company)
+    await app.state.redis_queue.enqueue_job("send_email_task", req.email, req.limit or 10, req.company)
     return {
         "status": "accepted",
         "message": f"Newsletter email queued for delivery to {req.email}."
@@ -743,14 +701,14 @@ def list_subscribers(_api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
 
 
 @app.post("/api/newsletter/broadcast", status_code=202)
-def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, background_tasks: BackgroundTasks = None, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
+async def broadcast_newsletter_to_all(req: Optional[BroadcastRequest] = None, _api_key: str = Depends(verify_api_key)) -> Dict[str, Any]:
     """
-    Broadcasts today's news digest to all active subscribers in the background.
+    Broadcasts today's news digest to all active subscribers in the background via ARQ.
     Returns immediately with 202 Accepted.
     """
     limit = req.limit if req and req.limit else 10
     company = req.company if req else None
-    background_tasks.add_task(_broadcast_background, limit, company)
+    await app.state.redis_queue.enqueue_job("broadcast_task", limit, company)
     return {
         "status": "accepted",
         "message": "Newsletter broadcast queued for all active subscribers."
