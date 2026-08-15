@@ -18,9 +18,11 @@ import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from db import get_db, get_collection as get_articles_collection, get_subscribers_collection
 
@@ -167,126 +169,114 @@ def fetch_todays_news(limit: int = 10, company: Optional[str] = None) -> List[Di
     return articles
 
 # ---------------------------------------------------------------------------
-# Newsletter HTML & Text Template Generators
+# Newsletter HTML & Text Template Generators (Jinja2)
 # ---------------------------------------------------------------------------
 
-def render_html_newsletter(articles: List[Dict[str, Any]], recipient_email: Optional[str] = None) -> str:
-    """
-    Renders a responsive, modern HTML email digest template.
-    """
-    date_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
-    
-    articles_html = ""
-    for idx, item in enumerate(articles, 1):
-        title = html_mod.escape(item.get("title") or "Untitled Article")
-        url = html_mod.escape(item.get("url") or "#")
-        source = html_mod.escape(item.get("source") or "News Pipeline")
-        category = html_mod.escape((item.get("category") or "General").capitalize())
-        description = html_mod.escape(item.get("description") or "No description available.")
-        published_at = item.get("published_at") or ""
-        image_url = item.get("image_url")
-        keywords = item.get("keywords") or []
+# Jinja2 environment — loads templates from the templates/ directory
+_TEMPLATE_DIR = Path(__file__).parent / "templates"
+_jinja_env = Environment(
+    loader=FileSystemLoader(str(_TEMPLATE_DIR)),
+    autoescape=select_autoescape(["html"]),
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+# Import signed token generator (soft import — works without API_SECRET_KEY set)
+try:
+    from tokens import generate_unsubscribe_url as _generate_unsub_url
+except Exception:
+    _generate_unsub_url = None
+    log.warning("tokens.py unavailable — signed unsubscribe links disabled.")
+
+
+def _prepare_template_articles(articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten article dicts into a template-friendly format with escaped fields."""
+    prepared = []
+    for item in articles:
         sentiment = item.get("sentiment", {})
-        polarity = sentiment.get("polarity", 0.0)
-
-        # Sentiment badge design
-        if polarity > 0.1:
-            sentiment_badge = '<span style="background-color: #d1fae5; color: #065f46; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px; margin-left: 6px;">Positive</span>'
-        elif polarity < -0.1:
-            sentiment_badge = '<span style="background-color: #fee2e2; color: #991b1b; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px; margin-left: 6px;">Negative</span>'
-        else:
-            sentiment_badge = '<span style="background-color: #f3f4f6; color: #374151; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 12px; margin-left: 6px;">Neutral</span>'
-
-        # Formatted keywords pills
-        kw_html = ""
-        if keywords:
-            tags = "".join(
-                f'<span style="display: inline-block; background-color: #eff6ff; color: #1e40af; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 4px; margin-right: 4px; margin-bottom: 4px;">#{html_mod.escape(kw)}</span>'
-                for kw in keywords[:4]
-            )
-            kw_html = f'<div style="margin-top: 10px;">{tags}</div>'
-
-        # Optional image block
-        img_html = ""
-        if image_url and image_url.startswith("http"):
-            img_html = f'<img src="{image_url}" alt="Article Image" style="width: 100%; max-height: 200px; object-fit: cover; border-radius: 8px; margin-bottom: 12px;" />'
-
-        articles_html += f"""
-        <div style="background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-            {img_html}
-            <div style="margin-bottom: 8px;">
-                <span style="background-color: #2563eb; color: #ffffff; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 4px; text-transform: uppercase;">{category}</span>
-                <span style="color: #6b7280; font-size: 12px; margin-left: 8px;">via <strong>{source}</strong></span>
-                {sentiment_badge}
-            </div>
-            <h2 style="margin: 8px 0; font-size: 18px; font-weight: 700; line-height: 1.3;">
-                <a href="{url}" target="_blank" style="color: #111827; text-decoration: none;">{title}</a>
-            </h2>
-            <p style="color: #4b5563; font-size: 14px; line-height: 1.5; margin: 8px 0 12px 0;">{description}</p>
-            {kw_html}
-            <div style="margin-top: 12px; padding-top: 10px; border-top: 1px solid #f3f4f6; text-align: right;">
-                <a href="{url}" target="_blank" style="display: inline-block; color: #2563eb; font-size: 13px; font-weight: 600; text-decoration: none;">Read full story &rarr;</a>
-            </div>
-        </div>
-        """
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily News Digest</title>
-</head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f3f4f6; margin: 0; padding: 20px 0; color: #1f2937;">
-    <div style="max-width: 640px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
-        <!-- Header -->
-        <div style="background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); color: #ffffff; padding: 32px 24px; text-align: center;">
-            <span style="background-color: rgba(255,255,255,0.15); font-size: 11px; font-weight: 700; letter-spacing: 1px; padding: 4px 12px; border-radius: 20px; text-transform: uppercase;">Daily News Pipeline Digest</span>
-            <h1 style="margin: 12px 0 4px 0; font-size: 26px; font-weight: 800;">Today's Headlines</h1>
-            <p style="margin: 0; color: #94a3b8; font-size: 14px;">{date_str} &bull; {len(articles)} Stories Curated For You</p>
-        </div>
-
-        <!-- Main Content Area -->
-        <div style="padding: 24px; background-color: #f9fafb;">
-            {articles_html}
-        </div>
-
-        <!-- Footer -->
-        <div style="background-color: #1e293b; color: #94a3b8; padding: 24px; text-align: center; font-size: 12px; line-height: 1.6;">
-            <p style="margin: 0 0 8px 0; font-weight: 600; color: #cbd5e1;">News Pipeline Automated Digest</p>
-            <p style="margin: 0 0 12px 0;">You are receiving this email because you subscribed to daily news updates.</p>
-            <p style="margin: 0;">
-                Powered by FastAPI &amp; MongoDB Atlas
-            </p>
-        </div>
-    </div>
-</body>
-</html>
-"""
-    return html
+        entities = item.get("entities", {})
+        prepared.append({
+            "title": html_mod.escape(item.get("title") or "Untitled Article"),
+            "url": html_mod.escape(item.get("url") or "#"),
+            "source": html_mod.escape(item.get("source") or "News Pipeline"),
+            "category": html_mod.escape((item.get("category") or "General").capitalize()),
+            "description": html_mod.escape(item.get("description") or "No description available."),
+            "published_at": item.get("published_at") or "",
+            "image_url": item.get("image_url"),
+            "keywords": [html_mod.escape(kw) for kw in (item.get("keywords") or [])],
+            "tickers": [html_mod.escape(t) for t in entities.get("tickers", [])],
+            "sentiment_label": sentiment.get("label", "neutral"),
+            "polarity": sentiment.get("polarity", 0.0),
+        })
+    return prepared
 
 
-def render_text_newsletter(articles: List[Dict[str, Any]]) -> str:
+def render_html_newsletter(
+    articles: List[Dict[str, Any]],
+    recipient_email: Optional[str] = None,
+) -> str:
     """
-    Renders a clean plain-text newsletter fallback.
+    Renders a responsive HTML email digest using the Jinja2 template.
+    Includes sentiment badges, ticker pills, and a signed unsubscribe link.
     """
     date_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
-    lines = [
-        "============================================================",
-        f"DAILY NEWS PIPELINE DIGEST — {date_str}",
-        "============================================================",
-        "",
-    ]
-    for idx, item in enumerate(articles, 1):
-        lines.append(f"{idx}. {item.get('title', 'Untitled')}")
-        lines.append(f"   Source: {item.get('source', 'Unknown')} | Category: {item.get('category', 'General')}")
-        lines.append(f"   Link: {item.get('url', '')}")
-        lines.append(f"   Summary: {item.get('description', '')}")
-        lines.append("")
+    prepared = _prepare_template_articles(articles)
 
-    lines.append("============================================================")
-    lines.append("Powered by News Pipeline Service")
-    return "\n".join(lines)
+    # Generate signed unsubscribe URL per recipient
+    unsubscribe_url = ""
+    if recipient_email and _generate_unsub_url:
+        try:
+            unsubscribe_url = _generate_unsub_url(recipient_email)
+        except Exception:
+            pass
+
+    # Compute summary stats for the header bar
+    sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+    for a in prepared:
+        label = a.get("sentiment_label", "neutral")
+        sentiment_counts[label] = sentiment_counts.get(label, 0) + 1
+
+    stats = [
+        {"value": len(prepared), "label": "Articles", "color": "#2563eb"},
+        {"value": sentiment_counts["positive"], "label": "Positive", "color": "#059669"},
+        {"value": sentiment_counts["negative"], "label": "Negative", "color": "#dc2626"},
+    ]
+
+    template = _jinja_env.get_template("digest.html")
+    return template.render(
+        subject=f"📰 News Pipeline Digest — {date_str}",
+        date_str=date_str,
+        article_count=len(prepared),
+        articles=prepared,
+        stats=stats,
+        unsubscribe_url=unsubscribe_url,
+    )
+
+
+def render_text_newsletter(
+    articles: List[Dict[str, Any]],
+    recipient_email: Optional[str] = None,
+) -> str:
+    """
+    Renders a plain-text newsletter fallback using the Jinja2 text template.
+    """
+    date_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+    prepared = _prepare_template_articles(articles)
+
+    unsubscribe_url = ""
+    if recipient_email and _generate_unsub_url:
+        try:
+            unsubscribe_url = _generate_unsub_url(recipient_email)
+        except Exception:
+            pass
+
+    template = _jinja_env.get_template("digest.txt")
+    return template.render(
+        date_str=date_str,
+        article_count=len(prepared),
+        articles=prepared,
+        unsubscribe_url=unsubscribe_url,
+    )
 
 # ---------------------------------------------------------------------------
 # Email Dispatching via SMTP
@@ -419,7 +409,7 @@ def broadcast_newsletter(limit: int = 10, company: Optional[str] = None) -> Dict
         for email in subscribers:
             try:
                 html_content = render_html_newsletter(articles, recipient_email=email)
-                text_content = render_text_newsletter(articles)
+                text_content = render_text_newsletter(articles, recipient_email=email)
 
                 msg = MIMEMultipart("alternative")
                 msg["Subject"] = subject
