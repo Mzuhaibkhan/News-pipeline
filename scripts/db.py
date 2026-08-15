@@ -101,6 +101,28 @@ def get_collection():
                 [("title", "text"), ("description", "text"), ("keywords", "text")],
                 background=True,
             )
+            # --- TTL Index: MongoDB automatically deletes documents older than
+            # ARTICLE_TTL_DAYS (default 15 days) in a background thread, removing
+            # the need for manual cleanup scripts. ---
+            ttl_days = int(os.getenv("ARTICLE_TTL_DAYS", "15"))
+            collection.create_index(
+                "published_at",
+                expireAfterSeconds=ttl_days * 24 * 60 * 60,
+                name="ttl_published_at",
+                background=True,
+            )
+            log.info("TTL index set: articles auto-expire after %d days.", ttl_days)
+            # --- Compound indexes for NLP-enriched field queries ---
+            collection.create_index(
+                [("entities.tickers", 1), ("published_at", -1)],
+                background=True,
+            )
+            collection.create_index(
+                [("sentiment.label", 1), ("published_at", -1)],
+                background=True,
+            )
+            collection.create_index("content_hash", background=True, sparse=True)
+            collection.create_index([("fetched_at", -1)], background=True)
             log.info("Indexes ensured on collection '%s'.", MONGO_COLLECTION)
             _indexes_ensured.add("articles")
 
@@ -193,3 +215,13 @@ def get_async_collection(read_pref=ReadPreference.SECONDARY_PREFERRED):
     """
     db = get_async_db()
     return db.get_collection(MONGO_COLLECTION, read_preference=read_pref)
+
+
+def get_async_subscribers_collection(read_pref=ReadPreference.PRIMARY):
+    """Return the *subscribers* collection via the async Motor client.
+
+    Uses PRIMARY read-preference by default since subscriber operations
+    often involve immediate-read-after-write consistency.
+    """
+    db = get_async_db()
+    return db.get_collection(MONGO_SUBSCRIBERS_COLLECTION, read_preference=read_pref)
