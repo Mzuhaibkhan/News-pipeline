@@ -1,0 +1,24 @@
+News Pipeline Digest — {{ date_str }}
+{{ "=" * 50 }}
+
+{{ article_count }} article{{ "s" if article_count != 1 else "" }} curated for you today.
+
+{% for article in articles %}
+---
+{{ loop.index }}. {{ article.title }}
+   Source: {{ article.source }}{% if article.published_at %} | {{ article.published_at }}{% endif %}
+
+   Category: {{ article.category }} | Sentiment: {{ article.sentiment_label }}
+{% if article.tickers %}   Tickers: {{ article.tickers | join(", ") }}
+{% endif %}{% if article.keywords %}   Keywords: {{ article.keywords[:4] | join(", ") }}
+{% endif %}
+   {{ article.description[:300] }}
+
+   Read more: {{ article.url }}
+
+{% endfor %}
+---
+
+{% if unsubscribe_url %}To unsubscribe: {{ unsubscribe_url }}{% endif %}
+
+Curated by News Pipeline — Your Financial Intelligence Feed
