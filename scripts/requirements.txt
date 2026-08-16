@@ -17,6 +17,7 @@ certifi>=2024.0.0
 
 # ── Caching & Messaging ──
 redis>=5.0.0,<6.0
+arq>=0.25.0,<1.0
 
 # ── NLP & Text Processing ──
 textblob>=0.18,<1.0
