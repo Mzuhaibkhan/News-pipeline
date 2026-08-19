@@ -71,7 +71,7 @@
                                 <tr>
                                     {% for stat in stats %}
                                     <td align="center" style="padding: 8px;">
-                                        <span class="stat-number" style="display: block; font-size: 24px; font-weight: 700; color: {{ stat.color }};">{{ stat.value }}</span>
+                                        <span class="stat-number" style="display: block; font-size: 24px; font-weight: 700;"><font color="{{ stat.color }}">{{ stat.value }}</font></span>
                                         <span style="font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px;">{{ stat.label }}</span>
                                     </td>
                                     {% endfor %}
