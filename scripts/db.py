@@ -16,7 +16,7 @@ import certifi
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient, ReadPreference
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, OperationFailure
 
 load_dotenv()
 
@@ -35,6 +35,16 @@ _client: MongoClient | None = None
 _client_lock = threading.Lock()
 _indexes_ensured: set[str] = set()
 _indexes_lock = threading.Lock()
+
+
+def _safe_create_index(collection, keys, **kwargs):
+    """Safely create an index without allowing non-fatal index conflicts to crash startup."""
+    try:
+        collection.create_index(keys, **kwargs)
+    except OperationFailure as exc:
+        log.warning("Index creation notice for %s on '%s': %s", keys, collection.name, exc)
+    except Exception as exc:
+        log.warning("Unexpected error creating index for %s on '%s': %s", keys, collection.name, exc)
 
 
 def get_client() -> MongoClient:
@@ -91,38 +101,65 @@ def get_collection():
 
     with _indexes_lock:
         if "articles" not in _indexes_ensured:
-            collection.create_index("url_hash", unique=True, background=True)
-            collection.create_index([("published_at", -1)], background=True)
-            collection.create_index("source", background=True)
-            collection.create_index("category", background=True)
-            collection.create_index([("category", 1), ("published_at", -1)], background=True)
-            collection.create_index([("source", 1), ("published_at", -1)], background=True)
-            collection.create_index(
+            _safe_create_index(collection, "url_hash", unique=True, background=True)
+            _safe_create_index(collection, [("published_at", -1)], background=True)
+            _safe_create_index(collection, "source", background=True)
+            _safe_create_index(collection, "category", background=True)
+            _safe_create_index(collection, [("category", 1), ("published_at", -1)], background=True)
+            _safe_create_index(collection, [("source", 1), ("published_at", -1)], background=True)
+            _safe_create_index(
+                collection,
                 [("title", "text"), ("description", "text"), ("keywords", "text")],
                 background=True,
             )
+
             # --- TTL Index: MongoDB automatically deletes documents older than
             # ARTICLE_TTL_DAYS (default 15 days) in a background thread, removing
             # the need for manual cleanup scripts. ---
             ttl_days = int(os.getenv("ARTICLE_TTL_DAYS", "15"))
-            collection.create_index(
-                "published_at",
-                expireAfterSeconds=ttl_days * 24 * 60 * 60,
-                name="ttl_published_at",
-                background=True,
-            )
-            log.info("TTL index set: articles auto-expire after %d days.", ttl_days)
+            if ttl_days > 0:
+                try:
+                    collection.create_index(
+                        "published_at",
+                        expireAfterSeconds=ttl_days * 24 * 60 * 60,
+                        name="ttl_published_at",
+                        background=True,
+                    )
+                    log.info("TTL index set: articles auto-expire after %d days.", ttl_days)
+                except OperationFailure as exc:
+                    # Handle IndexOptionsConflict (code 85) with legacy 'published_at_1' index
+                    if exc.code == 85 or "IndexOptionsConflict" in str(exc) or "already exists" in str(exc):
+                        log.info("Index conflict on published_at (code 85). Dropping legacy 'published_at_1' index...")
+                        try:
+                            collection.drop_index("published_at_1")
+                            collection.create_index(
+                                "published_at",
+                                expireAfterSeconds=ttl_days * 24 * 60 * 60,
+                                name="ttl_published_at",
+                                background=True,
+                            )
+                            log.info("Successfully dropped legacy index and created TTL index.")
+                        except Exception as drop_err:
+                            log.warning("Could not replace legacy published_at index with TTL index: %s", drop_err)
+                    else:
+                        log.warning("Could not create TTL index: %s", exc)
+                except Exception as exc:
+                    log.warning("Unexpected error creating TTL index: %s", exc)
+
             # --- Compound indexes for NLP-enriched field queries ---
-            collection.create_index(
+            _safe_create_index(
+                collection,
                 [("entities.tickers", 1), ("published_at", -1)],
                 background=True,
             )
-            collection.create_index(
+            _safe_create_index(
+                collection,
                 [("sentiment.label", 1), ("published_at", -1)],
                 background=True,
             )
-            collection.create_index("content_hash", background=True, sparse=True)
-            collection.create_index([("fetched_at", -1)], background=True)
+            _safe_create_index(collection, "content_hash", background=True, sparse=True)
+            _safe_create_index(collection, [("fetched_at", -1)], background=True)
+
             log.info("Indexes ensured on collection '%s'.", MONGO_COLLECTION)
             _indexes_ensured.add("articles")
 
@@ -143,7 +180,7 @@ def get_subscribers_collection():
 
     with _indexes_lock:
         if "subscribers" not in _indexes_ensured:
-            collection.create_index("email", unique=True)
+            _safe_create_index(collection, "email", unique=True)
             log.info("Indexes ensured on collection '%s'.", MONGO_SUBSCRIBERS_COLLECTION)
             _indexes_ensured.add("subscribers")
 
