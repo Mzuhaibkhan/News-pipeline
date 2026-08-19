@@ -507,7 +507,6 @@ async def get_articles(
 async def get_all_articles(
     request: Request,
     company: Optional[str] = Query(None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9\s\-\.]+$", description="Company name or ticker (alphanumeric, max 100 chars)"),
-    _api_key: str = Depends(verify_api_key),
 ):
     """
     Retrieves ALL fetched articles directly from the database without pagination.
