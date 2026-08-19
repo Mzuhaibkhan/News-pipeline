@@ -113,10 +113,8 @@ def get_collection():
                 background=True,
             )
 
-            # --- TTL Index: MongoDB automatically deletes documents older than
-            # ARTICLE_TTL_DAYS (default 15 days) in a background thread, removing
-            # the need for manual cleanup scripts. ---
-            ttl_days = int(os.getenv("ARTICLE_TTL_DAYS", "15"))
+            # --- TTL Index: Automatically disabled by default (0 = keep forever) ---
+            ttl_days = int(os.getenv("ARTICLE_TTL_DAYS", "0"))
             if ttl_days > 0:
                 try:
                     collection.create_index(
@@ -145,6 +143,12 @@ def get_collection():
                         log.warning("Could not create TTL index: %s", exc)
                 except Exception as exc:
                     log.warning("Unexpected error creating TTL index: %s", exc)
+            else:
+                try:
+                    collection.drop_index("ttl_published_at")
+                    log.info("TTL index disabled (dropped 'ttl_published_at'). Articles will persist indefinitely.")
+                except Exception:
+                    pass
 
             # --- Compound indexes for NLP-enriched field queries ---
             _safe_create_index(
